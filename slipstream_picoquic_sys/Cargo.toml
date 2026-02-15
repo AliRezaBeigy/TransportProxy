@@ -1,0 +1,15 @@
+[package]
+name = "slipstream_picoquic_sys"
+version = "0.1.0"
+edition = "2021"
+description = "FFI bindings to slipstream-picoquic (C QUIC implementation)"
+license = "MIT"
+
+[lib]
+name = "slipstream_picoquic_sys"
+
+[dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["ws2def"] }

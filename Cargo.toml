@@ -1,0 +1,72 @@
+[package]
+name = "proxy_server"
+version = "0.1.0"
+edition = "2021"
+description = "Transport comparison (KCP & QUIC): proxy harness and benchmarks"
+license = "MIT"
+
+[features]
+default = []
+# Enable ys-kcp (requires nightly toolchain)
+ys-kcp = ["dep:ys-kcp"]
+# Enable kcp-sys (requires libclang/LLVM for bindgen)
+kcp-sys = ["dep:kcp-sys"]
+# Enable slipstream-picoquic (QUIC over UDP via C library; requires CMake, OpenSSL, slipstream-picoquic source)
+slipstream-picoquic = ["dep:slipstream_picoquic_sys", "dep:libc", "dep:tempfile", "dep:windows-sys"]
+
+[dependencies]
+kcp-tokio = "0.4"
+# deepseeksss/kcp: core KCP protocol (sync) for comparison and protocol-level benchmarks (renamed to avoid clash with ys-kcp's kcp)
+kcp_deepseek = { package = "kcp", git = "https://github.com/deepseeksss/kcp" }
+# Optional: requires nightly (uses #![feature(stmt_expr_attributes)])
+ys-kcp = { version = "1.2", features = ["tokio"], optional = true }
+# Optional: requires libclang (LLVM) for build
+kcp-sys = { version = "0.1", optional = true }
+kcprs = "0.5"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+bytes = "1.0"
+# QUIC (quinn) for comparison — https://github.com/quinn-rs/quinn
+quinn = "0.11"
+# Slipstream-picoquic (optional): https://github.com/AliRezaBeigy/slipstream-picoquic
+slipstream_picoquic_sys = { path = "slipstream_picoquic_sys", optional = true }
+libc = { version = "0.2", optional = true }
+tempfile = { version = "3", optional = true }
+windows-sys = { version = "0.52", optional = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+rcgen = "0.12"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = "0.5"
+rand = "0.8"
+
+[[bin]]
+name = "proxy_server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "proxy_client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "load_test"
+path = "src/bin/load_test.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[[bench]]
+name = "proxy_bench"
+harness = false
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+# Use ys-kcp fork (https://github.com/AliRezaBeigy/ys-kcp).
+[patch.crates-io]
+ys-kcp = { git = "https://github.com/AliRezaBeigy/ys-kcp", branch = "master" }

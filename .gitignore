@@ -1,0 +1,53 @@
+# Build output
+/target/
+
+# Slipstream-picoquic / picoquic CMake build (scripts/build_slipstream_picoquic.sh)
+.slipstream-picoquic-build/
+.picoquic-build/
+
+# Cargo lock is typically committed for binaries; uncomment to ignore:
+# Cargo.lock
+
+# RustRover / JetBrains
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# VS Code (optional; remove if you commit workspace settings)
+# .vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Debug
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# Bench / test artifacts
+*.profraw
+*.profdata
+cargo-timing.html
+
+# Backup / temp
+*~
+*.swp
+*.swo
+*.bak
+
+# slipstream-picoquic PEM temp dir (Windows: under current dir for OpenSSL path compatibility)
+proxy_server_picoquic_temp/

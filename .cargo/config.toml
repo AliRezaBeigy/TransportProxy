@@ -1,0 +1,4 @@
+# Release profile: smaller/faster binaries (optional override)
+[profile.release]
+lto = true
+codegen-units = 1

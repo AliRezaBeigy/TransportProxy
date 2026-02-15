@@ -1,0 +1,3 @@
+[submodule "slipstream-picoquic"]
+	path = slipstream-picoquic
+	url = https://github.com/AliRezaBeigy/slipstream-picoquic.git
