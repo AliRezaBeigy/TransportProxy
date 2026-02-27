@@ -62,6 +62,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for lib in &picoquic_libs.libs {
         println!("cargo:rustc-link-lib=static={}", lib);
     }
+    // Rerun if any linked static lib changes on disk (e.g. after an external cmake rebuild).
+    // Also watch the Release/ subdirectory inside each search dir so that cmake --build triggers
+    // a re-link; sync updated .lib files to the .a aliases the linker resolves.
+    for dir in &picoquic_libs.search_dirs {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.extension().map(|e| e == "lib" || e == "a").unwrap_or(false) {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+        }
+        // Watch Release/ sub-dir (MSVC cmake output) and sync updated .lib → .a aliases.
+        let release_dir = dir.join("Release");
+        if release_dir.is_dir() {
+            for entry in std::fs::read_dir(&release_dir).into_iter().flatten().flatten() {
+                let src = entry.path();
+                if src.extension().map(|e| e == "lib").unwrap_or(false) {
+                    println!("cargo:rerun-if-changed={}", src.display());
+                    if let Some(stem) = src.file_stem().and_then(|s| s.to_str()) {
+                        // Sync: copy updated .lib to the .a aliases that the linker uses.
+                        for alias in &[
+                            dir.join(format!("lib{}.a", stem)),
+                            dir.join(format!("lib{}.a", stem.replace('-', "_"))),
+                        ] {
+                            if alias.exists() {
+                                let _ = std::fs::copy(&src, alias);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if is_windows {
         println!("cargo:rustc-link-lib=dylib=libssl");

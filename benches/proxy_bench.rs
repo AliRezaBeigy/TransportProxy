@@ -508,6 +508,10 @@ const IO_TIMEOUT: Duration = Duration::from_millis(800);
 /// Slipstream-picoquic QUIC+TLS handshake can exceed 800ms on some systems; use longer timeout for connect only.
 #[cfg(feature = "slipstream-picoquic")]
 const SLIPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// With 20 concurrent connections on a single-threaded picoquic loop, per-roundtrip latency can
+/// exceed the default 800ms IO_TIMEOUT. Use a longer timeout for the concurrent bench only.
+#[cfg(feature = "slipstream-picoquic")]
+const SLIPSTREAM_CONCURRENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// One echo round-trip per throughput iteration, matching all other implementations.
 /// The connection is reused per payload size (connect once outside b.iter), so handshake
 /// cost is still amortized — only the per-iteration unit is normalized.
@@ -1646,18 +1650,29 @@ criterion_group! {
 }
 
 // Slipstream-picoquic: real QUIC over UDP (echo server + client), same conditions as quinn/kcp_tokio.
+// Each bench group uses a separate port because the C picoquic_packet_loop runs on a dedicated
+// blocking thread that holds the UDP socket until the process exits — dropping the shutdown_tx
+// only stops the async accept loop, not the C thread. Reusing the same port across groups causes
+// the second bind to fail with PICOQUIC_ERROR_UNEXPECTED_ERROR (ret=1051).
 #[cfg(feature = "slipstream-picoquic")]
-const SLIPSTREAM_BENCH_PORT: u16 = 12446;
+const SLIPSTREAM_BENCH_PORT_THROUGHPUT: u16 = 12446;
+#[cfg(feature = "slipstream-picoquic")]
+const SLIPSTREAM_BENCH_PORT_LATENCY: u16 = 12447;
+#[cfg(feature = "slipstream-picoquic")]
+const SLIPSTREAM_BENCH_PORT_CONCURRENT: [u16; 3] = [12448, 12449, 12450];
 
 /// Returns (server_addr, shutdown_tx). Caller must keep shutdown_tx alive or the server exits.
 /// When cert_key_paths is Some, use those PEM paths (caller keeps files alive); required so client can trust the same cert.
+/// Each bench group must pass a distinct port — the C picoquic_packet_loop thread holds the UDP
+/// socket for the process lifetime so the same port cannot be reused across groups.
 #[cfg(feature = "slipstream-picoquic")]
 fn start_slipstream_echo_server_in_background(
     rt: &Runtime,
+    port: u16,
     cert_key_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
 ) -> (SocketAddr, tokio::sync::broadcast::Sender<()>) {
     use proxy_server::transport::run_slipstream_picoquic_server;
-    let addr: SocketAddr = ([127, 0, 0, 1], SLIPSTREAM_BENCH_PORT).into();
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
     rt.spawn(async move {
         let _ = run_slipstream_picoquic_server(
@@ -1742,9 +1757,13 @@ async fn slipstream_echo_roundtrips_one_connection(
     .await??;
     let mut buf = vec![0u8; payload.len()];
     for _ in 0..count {
-        tokio::time::timeout(IO_TIMEOUT, stream.write_all(payload)).await??;
-        tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
-        tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut buf)).await??;
+        tokio::time::timeout(SLIPSTREAM_CONCURRENT_IO_TIMEOUT, stream.write_all(payload)).await??;
+        tokio::time::timeout(SLIPSTREAM_CONCURRENT_IO_TIMEOUT, stream.flush()).await??;
+        tokio::time::timeout(
+            SLIPSTREAM_CONCURRENT_IO_TIMEOUT,
+            stream.read_exact(&mut buf),
+        )
+        .await??;
     }
     Ok(())
 }
@@ -1773,8 +1792,11 @@ fn bench_slipstream_throughput(c: &mut Criterion) {
     let key_path = key_file.path().to_path_buf();
     proxy_server::transport::ensure_slipstream_picoquic_tls_init();
     let rt = Runtime::new().unwrap();
-    let (addr, _server_guard) =
-        start_slipstream_echo_server_in_background(&rt, Some((cert_path.clone(), key_path)));
+    let (addr, _server_guard) = start_slipstream_echo_server_in_background(
+        &rt,
+        SLIPSTREAM_BENCH_PORT_THROUGHPUT,
+        Some((cert_path.clone(), key_path)),
+    );
     let cert_path_ref = cert_file.path();
     let mut group = c.benchmark_group("slipstream_throughput");
     group.warm_up_time(Duration::from_millis(500));
@@ -1841,8 +1863,11 @@ fn bench_slipstream_latency(c: &mut Criterion) {
     let key_path = key_file.path().to_path_buf();
     proxy_server::transport::ensure_slipstream_picoquic_tls_init();
     let rt = Runtime::new().unwrap();
-    let (addr, _server_guard) =
-        start_slipstream_echo_server_in_background(&rt, Some((cert_path, key_path)));
+    let (addr, _server_guard) = start_slipstream_echo_server_in_background(
+        &rt,
+        SLIPSTREAM_BENCH_PORT_LATENCY,
+        Some((cert_path, key_path)),
+    );
     let cert_path_ref = cert_file.path();
     let mut group = c.benchmark_group("slipstream_latency");
     group.warm_up_time(Duration::from_millis(500));
@@ -1885,7 +1910,7 @@ fn bench_slipstream_concurrent(c: &mut Criterion) {
     group.sample_size(30);
     let payload = [0xABu8; 64];
     let mut server_guard: Option<tokio::sync::broadcast::Sender<()>> = None;
-    for num_conns in [5, 10, 20] {
+    for (idx, num_conns) in [5usize, 10, 20].iter().copied().enumerate() {
         let name = format!("{}_connections_10_msgs", num_conns);
         eprintln!(
             "[bench]   running {} ({} connections in parallel, 10 echo roundtrips each over UDP)",
@@ -1893,27 +1918,35 @@ fn bench_slipstream_concurrent(c: &mut Criterion) {
         );
         let group_id = "slipstream_concurrent";
         let func_id = name.clone();
-        // Fresh server per case; drop previous so port is released before next bind.
+        // Each case uses its own port: packet_loop holds the UDP socket until process exit,
+        // so dropping the server guard does not free the port for a subsequent bind.
         drop(server_guard.take());
-        if num_conns != 5 {
-            std::thread::sleep(Duration::from_millis(400));
-        }
         let (addr, guard) = start_slipstream_echo_server_in_background(
             &rt,
+            SLIPSTREAM_BENCH_PORT_CONCURRENT[idx],
             Some((cert_path.clone(), key_path.clone())),
         );
         server_guard = Some(guard);
         let cert_path_clone = cert_path.clone();
+        // Stagger connection starts to avoid thundering herd (helps with 20 concurrent connections).
+        let stagger_ms = if num_conns > 10 { 5 } else { 0 };
+        if num_conns == 20 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
         group.bench_function(name.as_str(), |b| {
             b.iter(|| {
                 let failures = rt.block_on(async {
-                    // Run num_conns connections in parallel (no semaphore). Each connection does 10 echo roundtrips on one stream.
+                    // Run num_conns connections in parallel. Stagger start to reduce server load spike.
                     let mut handles = Vec::with_capacity(num_conns);
-                    for _ in 0..num_conns {
+                    for i in 0..num_conns {
                         let a = addr;
                         let cert = cert_path_clone.clone();
                         let pl = payload;
+                        let delay_ms = i as u64 * stagger_ms;
                         handles.push(tokio::spawn(async move {
+                            if delay_ms > 0 {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            }
                             slipstream_echo_roundtrips_one_connection(
                                 a,
                                 &pl,
@@ -1925,11 +1958,21 @@ fn bench_slipstream_concurrent(c: &mut Criterion) {
                         }));
                     }
                     let mut failures = 0usize;
+                    let mut first_error: Option<String> = None;
                     for h in handles {
                         match h.await {
                             Ok(Ok(())) => {}
-                            Ok(Err(_)) | Err(_) => {
+                            Ok(Err(e)) => {
                                 failures += 1;
+                                if first_error.is_none() {
+                                    first_error = Some(e.to_string());
+                                }
+                            }
+                            Err(e) => {
+                                failures += 1;
+                                if first_error.is_none() {
+                                    first_error = Some(format!("join: {}", e));
+                                }
                             }
                         }
                     }
@@ -1938,6 +1981,9 @@ fn bench_slipstream_concurrent(c: &mut Criterion) {
                             "[bench] slipstream_concurrent: {} worker(s) failed (e.g. broken pipe)",
                             failures
                         );
+                        if let Some(ref msg) = first_error {
+                            eprintln!("[bench] first error: {}", msg);
+                        }
                     }
                     failures
                 });

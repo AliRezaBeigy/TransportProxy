@@ -181,10 +181,14 @@ extern "C" {
         set_fin: c_int,
     ) -> c_int;
 
-    /// Return last OpenSSL error saved by picoquic before TLS context free (C: picoquic_openssl_get_saved_error).
+    /// OpenSSL error string captured at the point of failure in picoquic_master_tlscontext.
+    /// Returns "" (empty string) on success or if never called.
     pub fn picoquic_openssl_get_saved_error() -> *const c_char;
-    /// Return last failure step in picoquic_master_tlscontext (e.g. cipher_suite, cert_load). C: picoquic_get_last_tls_fail_step.
+    /// Short label of the step that failed in picoquic_master_tlscontext,
+    /// e.g. "cert_load", "key_load", "cipher_suite", "ok". Returns "" if never called.
     pub fn picoquic_get_last_tls_fail_step() -> *const c_char;
+    /// Longer description of the failure including filenames and OpenSSL error.
+    pub fn picoquic_get_tls_fail_detail() -> *const c_char;
 }
 
 /// Packet loop callback modes (picoquic_packet_loop_cb_enum).
@@ -208,8 +212,8 @@ pub struct packet_loop_time_check_arg_t {
     pub delta_t: i64,
 }
 
-/// OpenSSL error retrieval (libcrypto). Call after picoquic_create returns NULL to get the reason.
-/// Uses C library's saved error (captured before TLS context free) first; falls back to current ERR queue.
+/// Returns the OpenSSL error string captured by picoquic at the TLS context failure point.
+/// Returns None if the last call succeeded or picoquic_master_tlscontext was never called.
 pub fn get_openssl_last_error() -> Option<String> {
     unsafe {
         let saved = picoquic_openssl_get_saved_error();
@@ -219,30 +223,23 @@ pub fn get_openssl_last_error() -> Option<String> {
                 return Some(s);
             }
         }
-    }
-    extern "C" {
-        fn ERR_get_error() -> c_ulong;
-        fn ERR_error_string_n(e: c_ulong, buf: *mut c_char, len: size_t);
-    }
-    let mut buf = [0i8; 256];
-    let mut out = String::new();
-    unsafe {
-        loop {
-            let e = ERR_get_error();
-            if e == 0 {
-                break;
-            }
-            if !out.is_empty() {
-                out.push_str("; ");
-            }
-            ERR_error_string_n(e, buf.as_mut_ptr(), buf.len());
-            let s = std::ffi::CStr::from_ptr(buf.as_ptr()).to_string_lossy();
-            out.push_str(&s);
-        }
-    }
-    if out.is_empty() {
         None
-    } else {
-        Some(out)
+    }
+}
+
+/// Returns the detailed failure description from picoquic_master_tlscontext,
+/// including filenames and OpenSSL error. Returns None on success or if never called.
+pub fn get_tls_fail_detail() -> Option<String> {
+    unsafe {
+        let p = picoquic_get_tls_fail_detail();
+        if p.is_null() {
+            return None;
+        }
+        let s = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+        if s.is_empty() || s == "success" {
+            None
+        } else {
+            Some(s)
+        }
     }
 }

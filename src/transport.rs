@@ -429,6 +429,12 @@ mod slipstream_client {
         cnx: AtomicPtr<picoquic_cnx_t>,
         stream_id: std::sync::atomic::AtomicU64,
         disconnected: AtomicBool,
+        /// Set in TIME_CHECK when we want to close; acted on in AFTER_RECEIVE/AFTER_SEND (safe to call picoquic_close there).
+        should_close: AtomicBool,
+        /// Set after picoquic_close() has been called to avoid calling it again.
+        close_sent: AtomicBool,
+        /// Counts AFTER_* callbacks after close was sent; if too many pass without disconnected, force terminate.
+        close_wait_ticks: std::sync::atomic::AtomicU32,
         ready_tx: Option<tokio_mpsc::Sender<()>>,
         /// Data peeked in time_check; drain this first in after_send so we don't wait up to 1s for next wake.
         peek_buf: std::cell::UnsafeCell<Option<Vec<u8>>>,
@@ -463,9 +469,7 @@ mod slipstream_client {
                 if !bytes.is_null() && length > 0 {
                     let slice = std::slice::from_raw_parts(bytes, length);
                     let v = slice.to_vec();
-                    if ctx.recv_tx.try_send(v).is_err() {
-                        // channel full or closed
-                    }
+                    let _ = ctx.recv_tx.try_send(v);
                 }
             }
             picoquic_callback_stream_fin => {
@@ -501,19 +505,46 @@ mod slipstream_client {
             return 0;
         }
         if cb_mode == PICOQUIC_PACKET_LOOP_TIME_CHECK {
-            if !arg.is_null()
-                && !ctx.cnx.load(Ordering::Acquire).is_null()
+            /* Always cap idle wait so new writes or abandonment are noticed quickly. */
+            if !arg.is_null() {
+                let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
+                if time_arg.delta_t > 1_000 {
+                    time_arg.delta_t = 1_000;
+                }
+            }
+            /* If the async side abandoned us (recv_tx closed = receiver dropped), schedule close.
+             * We cannot call picoquic_close() here (re-entrancy risk); set a flag and act in AFTER_RECEIVE/AFTER_SEND. */
+            if ctx.recv_tx.is_closed() {
+                ctx.should_close.store(true, Ordering::Release);
+            }
+            if !ctx.cnx.load(Ordering::Acquire).is_null()
                 && ctx.stream_id.load(Ordering::Acquire) != STREAM_ID_NOT_SET
             {
                 let peek = &mut *ctx.peek_buf.get();
                 if peek.is_none() {
-                    if let Ok(data) = ctx.send_rx.try_recv() {
-                        *peek = Some(data);
+                    match ctx.send_rx.try_recv() {
+                        Ok(data) => *peek = Some(data),
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            /* send_tx dropped — schedule close; act in AFTER_RECEIVE/AFTER_SEND */
+                            ctx.should_close.store(true, Ordering::Release);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
                     }
                 }
-                if peek.is_some() {
+                if !arg.is_null() {
                     let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
-                    time_arg.delta_t = 2000; /* 2ms so loop wakes soon and drains send_rx */
+                    if ctx.should_close.load(Ordering::Acquire) {
+                        /* Force immediate wakeup so AFTER_SEND fires and we can call picoquic_close. */
+                        time_arg.delta_t = 0;
+                    } else if peek.is_some() {
+                        time_arg.delta_t = 500; /* 0.5ms — drain immediately */
+                    }
+                }
+            } else if ctx.should_close.load(Ordering::Acquire) {
+                /* cnx not yet set or stream not opened but close requested — force wakeup. */
+                if !arg.is_null() {
+                    let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
+                    time_arg.delta_t = 0;
                 }
             }
             return 0;
@@ -521,6 +552,31 @@ mod slipstream_client {
         if cb_mode == PICOQUIC_PACKET_LOOP_AFTER_RECEIVE
             || cb_mode == PICOQUIC_PACKET_LOOP_AFTER_SEND
         {
+            /* If TIME_CHECK flagged a close request, call picoquic_close here (safe in AFTER_* callbacks).
+             * Do NOT terminate immediately — let the loop run so CONNECTION_CLOSE is actually transmitted.
+             * We terminate when disconnected=true (set by stream_callback on callback_close/callback_application_close). */
+            if ctx.should_close.load(Ordering::Acquire) {
+                let cnx = ctx.cnx.load(Ordering::Acquire);
+                if ctx.disconnected.load(Ordering::Acquire) {
+                    /* Server acknowledged our close — now safe to exit. */
+                    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                }
+                if cnx.is_null() {
+                    /* No connection established yet — just terminate. */
+                    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                }
+                if !ctx.close_sent.load(Ordering::Acquire) {
+                    /* Queue CONNECTION_CLOSE; loop continues to transmit it. */
+                    picoquic_close(cnx, 0);
+                    ctx.close_sent.store(true, Ordering::Release);
+                }
+                /* Safety: if we've been waiting too long (~5000 AFTER_* callbacks), force terminate. */
+                let ticks = ctx.close_wait_ticks.fetch_add(1, Ordering::Relaxed);
+                if ticks > 5000 {
+                    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                }
+                return 0; /* Keep looping so the close frame is sent. */
+            }
             let cnx = ctx.cnx.load(Ordering::Acquire);
             let stream_id = ctx.stream_id.load(Ordering::Acquire);
             if !cnx.is_null() && stream_id != STREAM_ID_NOT_SET {
@@ -560,7 +616,9 @@ mod slipstream_client {
                             }
                         }
                         Err(mpsc::TryRecvError::Disconnected) => {
-                            return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                            /* send_tx dropped — schedule close via should_close flag; loop will transmit then exit */
+                            ctx.should_close.store(true, Ordering::Release);
+                            break;
                         }
                         Err(mpsc::TryRecvError::Empty) => break,
                     }
@@ -579,9 +637,9 @@ mod slipstream_client {
         trusted_cert_path: Option<std::path::PathBuf>,
     ) -> Result<ProxyStream> {
         let port = server_addr.port() as i32;
-        let (recv_tx, recv_rx) = tokio_mpsc::channel::<Vec<u8>>(256);
-        let (send_tx, send_rx) = mpsc::sync_channel::<Vec<u8>>(64);
-        let (wake_tx, wake_rx) = tokio_mpsc::channel::<()>(64);
+        let (recv_tx, recv_rx) = tokio_mpsc::channel::<Vec<u8>>(4096);
+        let (send_tx, send_rx) = mpsc::sync_channel::<Vec<u8>>(512);
+        let (wake_tx, wake_rx) = tokio_mpsc::channel::<()>(512);
         let (ready_tx, mut ready_rx) = tokio_mpsc::channel::<()>(1);
 
         let host = server_addr.ip().to_string();
@@ -611,6 +669,9 @@ mod slipstream_client {
                 cnx: AtomicPtr::new(std::ptr::null_mut()),
                 stream_id: std::sync::atomic::AtomicU64::new(STREAM_ID_NOT_SET),
                 disconnected: AtomicBool::new(false),
+                should_close: AtomicBool::new(false),
+                close_sent: AtomicBool::new(false),
+                close_wait_ticks: std::sync::atomic::AtomicU32::new(0),
                 ready_tx: Some(ready_tx),
                 peek_buf: std::cell::UnsafeCell::new(None),
             });
@@ -621,13 +682,13 @@ mod slipstream_client {
             let ok = unsafe {
                 let mut addr_buf = [0u8; 128];
                 let mut is_name: c_int = 0;
-                if picoquic_get_server_address(
+                let addr_ret = picoquic_get_server_address(
                     host_c.as_ptr(),
                     port,
                     addr_buf.as_mut_ptr() as *mut _,
                     &mut is_name,
-                ) != 0
-                {
+                );
+                if addr_ret != 0 {
                     false
                 } else {
                     let current_time = picoquic_current_time();
@@ -671,11 +732,12 @@ mod slipstream_client {
                             false
                         } else {
                             picoquic_set_callback(cnx, Some(stream_callback), ctx_ptr as *mut _);
-                            if picoquic_start_client_cnx(cnx) != 0 {
+                            let start_ret = picoquic_start_client_cnx(cnx);
+                            if start_ret != 0 {
                                 picoquic_free(quic);
                                 false
                             } else {
-                                let _ = picoquic_packet_loop(
+                                let _loop_ret = picoquic_packet_loop(
                                     quic,
                                     0,
                                     0,
@@ -964,9 +1026,7 @@ mod slipstream_server {
                 std::ptr::null(),
                 0,
             );
-            if quic.is_null() {
-                // TLS context creation failed (e.g. cert_load on Windows if files were held open).
-            } else {
+            if !quic.is_null() {
                 picoquic_free(quic);
             }
         }
@@ -1022,9 +1082,9 @@ mod slipstream_server {
                 if let Some(state) = map.get_mut(&key) {
                     if state.stream_id.is_none() {
                         state.stream_id = Some(stream_id);
-                        let (recv_tx, recv_rx) = tokio_mpsc::channel(256);
-                        let (send_tx, send_rx) = mpsc::sync_channel(64);
-                        let (wake_tx, wake_rx) = tokio_mpsc::channel(64);
+                        let (recv_tx, recv_rx) = tokio_mpsc::channel(4096);
+                        let (send_tx, send_rx) = mpsc::sync_channel(512);
+                        let (wake_tx, wake_rx) = tokio_mpsc::channel(512);
                         state.recv_tx = Some(recv_tx.clone());
                         state.send_rx = Some(send_rx);
                         state.wake_tx = Some(wake_tx);
@@ -1085,7 +1145,10 @@ mod slipstream_server {
         }
         if cb_mode == PICOQUIC_PACKET_LOOP_TIME_CHECK && !arg.is_null() {
             let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
-            time_arg.delta_t = 2000; /* 2ms so server wakes to drain send_rx (echo replies) */
+            /* Always cap idle wait at 1ms so new writes from async tasks are noticed quickly. */
+            if time_arg.delta_t > 1_000 {
+                time_arg.delta_t = 1_000;
+            }
         }
         if cb_mode == PICOQUIC_PACKET_LOOP_AFTER_RECEIVE
             || cb_mode == PICOQUIC_PACKET_LOOP_AFTER_SEND
@@ -1252,7 +1315,7 @@ mod slipstream_server {
             let ok = unsafe {
                 let current_time = picoquic_current_time();
                 let mut quic = picoquic_create(
-                    8,
+                    1024,
                     cert_c.as_ptr(),
                     key_c.as_ptr(),
                     std::ptr::null(),
@@ -1268,7 +1331,6 @@ mod slipstream_server {
                     std::ptr::null(),
                     0,
                 );
-                let mut used_fallback_cert = false;
                 if quic.is_null() {
                     // Retry with server-created PEM files in case provided cert/key paths were invalid.
                     if let Ok((cert_file, key_file)) = create_temp_pem_files() {
@@ -1283,7 +1345,7 @@ mod slipstream_server {
                             CString::new(key_s.as_bytes()),
                         ) {
                             quic = picoquic_create(
-                                8,
+                                1024,
                                 c2.as_ptr(),
                                 k2.as_ptr(),
                                 std::ptr::null(),
@@ -1299,16 +1361,12 @@ mod slipstream_server {
                                 std::ptr::null(),
                                 0,
                             );
-                            if !quic.is_null() {
-                                used_fallback_cert = true;
-                            }
                         }
                     }
                 }
                 if quic.is_null() {
                     false
                 } else {
-                    let _ = used_fallback_cert;
                     let _ret = picoquic_packet_loop(
                         quic,
                         port,
