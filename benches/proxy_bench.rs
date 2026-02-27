@@ -1,6 +1,4 @@
 //! Criterion benchmarks: throughput and latency of KCP/QUIC echo over localhost.
-//! All implementations use **real UDP** (localhost) for a fair comparison, except kcp_sys (in-process).
-//! Some items are only used with optional features (ys-kcp, kcp-sys, slipstream-picoquic).
 #![allow(dead_code)]
 
 //! - **kcp_tokio**: kcp-tokio over UDP
@@ -9,7 +7,7 @@
 //! - **quinn**: https://github.com/quinn-rs/quinn — QUIC over UDP (TLS)
 //! - **slipstream-picoquic** (optional): QUIC over UDP via C lib
 //! - **ys-kcp** (optional, nightly): https://crates.io/crates/ys-kcp — over UDP (bench bridge)
-//! - **kcp-sys** (optional, libclang): https://crates.io/crates/kcp-sys — in-process only
+//! - **kcp-sys** (optional, libclang): https://crates.io/crates/kcp-sys — KCP over UDP
 
 use anyhow::Result;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
@@ -305,7 +303,7 @@ fn ys_kcp_echo_roundtrip_udp(
 
     current += 5;
 
-    const YS_KCP_SLEEP_US: u64 = 50; // bounded wait per iteration
+    const YS_KCP_SLEEP_US: u64 = 200; // bounded wait per iteration; matches kcp_deepseek/kcprs
     for _ in 0..max_iter {
         std::thread::sleep(Duration::from_micros(YS_KCP_SLEEP_US)); // Bounded wait
                                                                     // ys-kcp: update first so current is set and flush runs (matches in-memory loop and update() doc)
@@ -510,9 +508,11 @@ const IO_TIMEOUT: Duration = Duration::from_millis(800);
 /// Slipstream-picoquic QUIC+TLS handshake can exceed 800ms on some systems; use longer timeout for connect only.
 #[cfg(feature = "slipstream-picoquic")]
 const SLIPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Number of echo round-trips per throughput iteration so handshake cost is amortized.
+/// One echo round-trip per throughput iteration, matching all other implementations.
+/// The connection is reused per payload size (connect once outside b.iter), so handshake
+/// cost is still amortized — only the per-iteration unit is normalized.
 #[cfg(feature = "slipstream-picoquic")]
-const SLIPSTREAM_THROUGHPUT_ROUNDTRIPS: u32 = 20;
+const SLIPSTREAM_THROUGHPUT_ROUNDTRIPS: u32 = 1;
 const REBIND_DELAY: Duration = Duration::from_millis(200);
 
 fn init_bench_logging() {
@@ -774,14 +774,13 @@ fn start_quinn_echo_server_in_background(rt: &Runtime) -> Result<Arc<RwLock<Sock
     Ok(current_addr)
 }
 
+/// Reuses a pre-created Endpoint so socket creation is not in the hot path.
 async fn quinn_echo_roundtrip(
     current_addr: &Arc<RwLock<SocketAddr>>,
     payload: &[u8],
-    client_config: &quinn::ClientConfig,
+    endpoint: &quinn::Endpoint,
 ) -> Result<usize> {
     let addr = *current_addr.read().await;
-    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap())?;
-    endpoint.set_default_client_config(client_config.clone());
     let connecting = endpoint.connect(addr, "localhost")?;
     let conn = tokio::time::timeout(IO_TIMEOUT, connecting).await??;
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -790,7 +789,6 @@ async fn quinn_echo_roundtrip(
     let mut buf = vec![0u8; payload.len()];
     tokio::time::timeout(IO_TIMEOUT, recv.read_exact(&mut buf)).await??;
     conn.close(0u32.into(), b"done");
-    endpoint.wait_idle().await;
     Ok(payload.len())
 }
 
@@ -804,22 +802,30 @@ fn bench_quinn_throughput(c: &mut Criterion) {
     let current_addr =
         start_quinn_echo_server_in_background_with_config(&rt, &server_config).unwrap();
     let client_config = build_quinn_client_config(&cert_der).unwrap();
+    // One shared endpoint: avoids per-iteration socket creation so the hot path
+    // only measures connect + KCP/QUIC roundtrip, matching kcp_tokio's setup.
+    // quinn::Endpoint::client binds a tokio UdpSocket, so it must run inside
+    // an active runtime context.
+    let _rt_guard = rt.enter();
+    let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client_endpoint.set_default_client_config(client_config);
+    let client_endpoint = Arc::new(client_endpoint);
 
     let mut group = c.benchmark_group("quinn_throughput");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
         eprintln!("[bench]   running {} (connect + 1 echo round-trip)", name);
-        let client_config = client_config.clone();
+        let client_endpoint = Arc::clone(&client_endpoint);
         let func_id = name.clone();
         group.bench_function(name, |b| {
             b.iter(|| {
                 let payload = vec![0xABu8; size];
                 let n = rt.block_on(async {
-                    match quinn_echo_roundtrip(&current_addr, &payload, &client_config).await {
+                    match quinn_echo_roundtrip(&current_addr, &payload, &client_endpoint).await {
                         Ok(n) => n,
                         Err(e) => {
                             eprintln!("[bench] warning: quinn throughput roundtrip failed: {e}");
@@ -896,16 +902,20 @@ fn bench_quinn_latency(c: &mut Criterion) {
     let current_addr =
         start_quinn_echo_server_in_background_with_config(&rt, &server_config).unwrap();
     let client_config = build_quinn_client_config(&cert_der).unwrap();
+    let _rt_guard = rt.enter();
+    let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client_endpoint.set_default_client_config(client_config);
+    let client_endpoint = Arc::new(client_endpoint);
 
     let mut group = c.benchmark_group("quinn_latency");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     eprintln!("[bench]   running echo_rtt_64b (connect + 1 echo)");
     group.bench_function("echo_rtt_64b", |b| {
         b.iter(|| {
             let n = rt.block_on(async {
-                match quinn_echo_roundtrip(&current_addr, &[0xABu8; 64], &client_config).await {
+                match quinn_echo_roundtrip(&current_addr, &[0xABu8; 64], &client_endpoint).await {
                     Ok(n) => n,
                     Err(e) => {
                         eprintln!("[bench] warning: quinn latency roundtrip failed: {e}");
@@ -931,18 +941,24 @@ fn bench_quinn_concurrent(c: &mut Criterion) {
     let current_addr =
         start_quinn_echo_server_in_background_with_config(&rt, &server_config).unwrap();
     let client_config = build_quinn_client_config(&cert_der).unwrap();
+    // One shared endpoint for all concurrent tasks: one UDP socket, N QUIC connections.
+    // This reflects QUIC's design and avoids per-task socket creation overhead.
+    let _rt_guard = rt.enter();
+    let mut client_endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    client_endpoint.set_default_client_config(client_config);
+    let client_endpoint = Arc::new(client_endpoint);
 
     let mut group = c.benchmark_group("quinn_concurrent");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     for num_conns in [5, 10, 20] {
         let name = format!("{}_connections_10_msgs", num_conns);
         eprintln!(
             "[bench]   running {} (parallel connect + 10 echo each)",
             name
         );
-        let client_config = client_config.clone();
+        let client_endpoint = Arc::clone(&client_endpoint);
         let group_id = "quinn_concurrent";
         let func_id = name.clone();
         group.bench_function(name, |b| {
@@ -951,13 +967,10 @@ fn bench_quinn_concurrent(c: &mut Criterion) {
                     let mut handles = Vec::with_capacity(num_conns);
                     for _ in 0..num_conns {
                         let current_addr = Arc::clone(&current_addr);
-                        let client_config = client_config.clone();
+                        let ep = Arc::clone(&client_endpoint);
                         handles.push(tokio::spawn(async move {
                             let a = *current_addr.read().await;
-                            let mut endpoint =
-                                quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-                            endpoint.set_default_client_config(client_config);
-                            let connecting = endpoint.connect(a, "localhost")?;
+                            let connecting = ep.connect(a, "localhost")?;
                             let conn = tokio::time::timeout(IO_TIMEOUT, connecting).await??;
                             for _ in 0..10 {
                                 let (mut send, mut recv) = conn.open_bi().await?;
@@ -1006,9 +1019,9 @@ fn bench_throughput(c: &mut Criterion) {
     let current_addr = start_echo_server_in_background(&rt);
 
     let mut group = c.benchmark_group("kcp_tokio_throughput");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
@@ -1047,9 +1060,9 @@ fn bench_latency(c: &mut Criterion) {
     let current_addr = start_echo_server_in_background(&rt);
 
     let mut group = c.benchmark_group("kcp_tokio_latency");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     eprintln!("[bench]   running echo_rtt_64b (connect + 1 echo)");
     group.bench_function("echo_rtt_64b", |b| {
         b.iter(|| {
@@ -1080,9 +1093,9 @@ fn bench_concurrent_connections(c: &mut Criterion) {
     let current_addr = start_echo_server_in_background(&rt);
 
     let mut group = c.benchmark_group("kcp_tokio_concurrent");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     for num_conns in [5, 10, 20] {
         let name = format!("{}_connections_10_msgs", num_conns);
         eprintln!(
@@ -1150,9 +1163,9 @@ fn bench_kcp_deepseek_throughput(c: &mut Criterion) {
     eprintln!("[bench] === kcp_deepseek throughput (UDP localhost, 5 payload sizes) ===");
 
     let mut group = c.benchmark_group("kcp_deepseek_throughput");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
@@ -1160,8 +1173,8 @@ fn bench_kcp_deepseek_throughput(c: &mut Criterion) {
         let func_id = name.clone();
         group.bench_function(name, |b| {
             let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
-            let base_ms = current_ms();
             b.iter(|| {
+                let base_ms = current_ms();
                 let n = kcp_deepseek_echo_roundtrip_udp(&payload, base_ms).unwrap_or(0);
                 let ok = n > 0;
                 record_bench_success(group_id, &func_id, ok);
@@ -1178,29 +1191,33 @@ fn bench_kcp_deepseek_concurrent(c: &mut Criterion) {
     eprintln!("[bench] === kcp_deepseek concurrent (5/10/20 × 10 msgs over UDP) ===");
 
     let mut group = c.benchmark_group("kcp_deepseek_concurrent");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     let payload = [0xABu8; 64];
     for num_conns in [5, 10, 20] {
         let name = format!("{}_connections_10_msgs", num_conns);
         let group_id = "kcp_deepseek_concurrent";
         let func_id = name.clone();
         group.bench_function(name, |b| {
-            let base_ms = current_ms();
             b.iter(|| {
-                let mut ok_count = 0usize;
-                for conn in 0..num_conns {
-                    let base = base_ms + (conn as u32) * 5000;
-                    for _ in 0..10 {
-                        if kcp_deepseek_echo_roundtrip_udp(&payload, base)
-                            .map(|n| n > 0)
-                            .unwrap_or(false)
-                        {
-                            ok_count += 1;
-                        }
-                    }
-                }
+                let base_ms = current_ms();
+                // Spawn one thread per connection so concurrency matches kcp_tokio / quinn.
+                let handles: Vec<_> = (0..num_conns)
+                    .map(|conn| {
+                        let base = base_ms.wrapping_add((conn as u32).wrapping_mul(5000));
+                        std::thread::spawn(move || {
+                            (0..10)
+                                .filter(|_| {
+                                    kcp_deepseek_echo_roundtrip_udp(&payload, base)
+                                        .map(|n| n > 0)
+                                        .unwrap_or(false)
+                                })
+                                .count()
+                        })
+                    })
+                    .collect();
+                let ok_count: usize = handles.into_iter().map(|h| h.join().unwrap_or(0)).sum();
                 let ok = ok_count == num_conns * 10;
                 record_bench_success(group_id, &func_id, ok);
             })
@@ -1214,13 +1231,13 @@ fn bench_kcp_deepseek_latency(c: &mut Criterion) {
     eprintln!("[bench] === kcp_deepseek latency (UDP echo RTT 64B) ===");
 
     let mut group = c.benchmark_group("kcp_deepseek_latency");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     group.bench_function("echo_rtt_64b", |b| {
         let payload = [0xABu8; 64];
-        let base_ms = current_ms();
         b.iter(|| {
+            let base_ms = current_ms();
             let n = kcp_deepseek_echo_roundtrip_udp(&payload, base_ms).unwrap_or(0);
             let ok = n > 0;
             record_bench_success("kcp_deepseek_latency", "echo_rtt_64b", ok);
@@ -1237,9 +1254,9 @@ fn bench_kcprs_throughput(c: &mut Criterion) {
     eprintln!("[bench] === kcprs throughput (UDP localhost) ===");
 
     let mut group = c.benchmark_group("kcprs_throughput");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
@@ -1247,8 +1264,8 @@ fn bench_kcprs_throughput(c: &mut Criterion) {
         let func_id = name.clone();
         group.bench_function(name, |b| {
             let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
-            let base_ms = current_ms();
             b.iter(|| {
+                let base_ms = current_ms();
                 let n = kcprs_echo_roundtrip_udp(&payload, base_ms).unwrap_or(0);
                 let ok = n > 0;
                 record_bench_success(group_id, &func_id, ok);
@@ -1264,13 +1281,13 @@ fn bench_kcprs_latency(c: &mut Criterion) {
     eprintln!("[bench] === kcprs latency (UDP echo RTT 64B) ===");
 
     let mut group = c.benchmark_group("kcprs_latency");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     group.bench_function("echo_rtt_64b", |b| {
         let payload = [0xABu8; 64];
-        let base_ms = current_ms();
         b.iter(|| {
+            let base_ms = current_ms();
             let n = kcprs_echo_roundtrip_udp(&payload, base_ms).unwrap_or(0);
             let ok = n > 0;
             record_bench_success("kcprs_latency", "echo_rtt_64b", ok);
@@ -1285,29 +1302,33 @@ fn bench_kcprs_concurrent(c: &mut Criterion) {
     eprintln!("[bench] === kcprs concurrent (5/10/20 × 10 msgs over UDP) ===");
 
     let mut group = c.benchmark_group("kcprs_concurrent");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     let payload = [0xABu8; 64];
     for num_conns in [5, 10, 20] {
         let name = format!("{}_connections_10_msgs", num_conns);
         let group_id = "kcprs_concurrent";
         let func_id = name.clone();
         group.bench_function(name, |b| {
-            let base_ms = current_ms();
             b.iter(|| {
-                let mut ok_count = 0usize;
-                for conn in 0..num_conns {
-                    let base = base_ms + (conn as u32) * 5000;
-                    for _ in 0..10 {
-                        if kcprs_echo_roundtrip_udp(&payload, base)
-                            .map(|n| n > 0)
-                            .unwrap_or(false)
-                        {
-                            ok_count += 1;
-                        }
-                    }
-                }
+                let base_ms = current_ms();
+                // Spawn one thread per connection so concurrency matches kcp_tokio / quinn.
+                let handles: Vec<_> = (0..num_conns)
+                    .map(|conn| {
+                        let base = base_ms.wrapping_add((conn as u32).wrapping_mul(5000));
+                        std::thread::spawn(move || {
+                            (0..10)
+                                .filter(|_| {
+                                    kcprs_echo_roundtrip_udp(&payload, base)
+                                        .map(|n| n > 0)
+                                        .unwrap_or(false)
+                                })
+                                .count()
+                        })
+                    })
+                    .collect();
+                let ok_count: usize = handles.into_iter().map(|h| h.join().unwrap_or(0)).sum();
                 let ok = ok_count == num_conns * 10;
                 record_bench_success(group_id, &func_id, ok);
             })
@@ -1322,9 +1343,9 @@ fn bench_ys_kcp_throughput(c: &mut Criterion) {
     eprintln!("[bench] === ys_kcp throughput (UDP localhost) ===");
 
     let mut group = c.benchmark_group("ys_kcp_throughput");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
@@ -1332,8 +1353,8 @@ fn bench_ys_kcp_throughput(c: &mut Criterion) {
         let func_id = name.clone();
         group.bench_function(name, |b| {
             let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
-            let base_ms = current_ms();
             b.iter(|| {
+                let base_ms = current_ms();
                 let n = ys_kcp_echo_roundtrip_udp(&payload, base_ms, None).unwrap_or(0);
                 let ok = n > 0;
                 record_bench_success(group_id, &func_id, ok);
@@ -1350,13 +1371,13 @@ fn bench_ys_kcp_latency(c: &mut Criterion) {
     eprintln!("[bench] === ys_kcp latency (UDP echo RTT 64B) ===");
 
     let mut group = c.benchmark_group("ys_kcp_latency");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     group.bench_function("echo_rtt_64b", |b| {
         let payload = [0xABu8; 64];
-        let base_ms = current_ms();
         b.iter(|| {
+            let base_ms = current_ms();
             let n = ys_kcp_echo_roundtrip_udp(&payload, base_ms, None).unwrap_or(0);
             let ok = n > 0;
             record_bench_success("ys_kcp_latency", "echo_rtt_64b", ok);
@@ -1372,29 +1393,33 @@ fn bench_ys_kcp_concurrent(c: &mut Criterion) {
     eprintln!("[bench] === ys_kcp concurrent (5/10/20 × 10 msgs over UDP) ===");
 
     let mut group = c.benchmark_group("ys_kcp_concurrent");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     let payload = [0xABu8; 64];
     for num_conns in [5, 10, 20] {
         let name = format!("{}_connections_10_msgs", num_conns);
         let group_id = "ys_kcp_concurrent";
         let func_id = name.clone();
         group.bench_function(name, |b| {
-            let base_ms = current_ms();
             b.iter(|| {
-                let mut ok_count = 0usize;
-                for conn in 0..num_conns {
-                    let base = base_ms + (conn as u32) * 5000;
-                    for _ in 0..10 {
-                        let success = ys_kcp_echo_roundtrip_udp(&payload, base, None)
-                            .map(|n| n > 0)
-                            .unwrap_or(false);
-                        if success {
-                            ok_count += 1;
-                        }
-                    }
-                }
+                let base_ms = current_ms();
+                // Spawn one thread per connection so concurrency matches kcp_tokio / quinn.
+                let handles: Vec<_> = (0..num_conns)
+                    .map(|conn| {
+                        let base = base_ms.wrapping_add((conn as u32).wrapping_mul(5000));
+                        std::thread::spawn(move || {
+                            (0..10)
+                                .filter(|_| {
+                                    ys_kcp_echo_roundtrip_udp(&payload, base, None)
+                                        .map(|n| n > 0)
+                                        .unwrap_or(false)
+                                })
+                                .count()
+                        })
+                    })
+                    .collect();
+                let ok_count: usize = handles.into_iter().map(|h| h.join().unwrap_or(0)).sum();
                 let ok = ok_count == num_conns * 10;
                 record_bench_success(group_id, &func_id, ok);
             })
@@ -1405,13 +1430,21 @@ fn bench_ys_kcp_concurrent(c: &mut Criterion) {
 
 #[cfg(feature = "kcp-sys")]
 async fn kcp_sys_echo_roundtrip(payload: &[u8]) -> Result<usize> {
-    use bytes::Bytes;
+    use bytes::{Bytes, BytesMut};
     use kcp_sys::endpoint::KcpEndpoint;
+    use kcp_sys::packet_def::KcpPacket;
     use kcp_sys::stream::KcpStream;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UdpSocket;
     use tokio::sync::Mutex;
 
-    // Two endpoints: A (client) and B (server). Forward A↔B so handshake and data flow.
+    // Two endpoints: A (client) and B (server). Packets are routed through real UDP loopback
+    // sockets so the kernel network stack is exercised, matching kcp_deepseek/kcprs/ys-kcp.
+    let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_addr = server_sock.local_addr()?;
+    let client_addr = client_sock.local_addr()?;
+
     let mut ep_a = KcpEndpoint::new();
     let mut ep_b = KcpEndpoint::new();
     let mut out_a = ep_a.output_receiver().take().expect("output receiver");
@@ -1421,20 +1454,52 @@ async fn kcp_sys_echo_roundtrip(payload: &[u8]) -> Result<usize> {
     ep_a.run().await;
     ep_b.run().await;
 
-    let input_b_fwd = input_b.clone();
-    let input_a_fwd = input_a.clone();
-    tokio::spawn(async move {
+    // Spawn all forwarding tasks with abort handles so they are torn down when this function
+    // returns, preventing zombie tasks from interfering with the next iteration's sockets.
+    let mut task_handles = Vec::new();
+
+    // ep_a output → UDP → server socket
+    let s = Arc::clone(&client_sock);
+    task_handles.push(tokio::spawn(async move {
+        while let Some(pkt) = out_a.recv().await {
+            let bytes: Bytes = pkt.into();
+            let _ = s.send_to(&bytes, server_addr).await;
+        }
+    }));
+    // ep_b output → UDP → client socket
+    let s = Arc::clone(&server_sock);
+    task_handles.push(tokio::spawn(async move {
+        while let Some(pkt) = out_b.recv().await {
+            let bytes: Bytes = pkt.into();
+            let _ = s.send_to(&bytes, client_addr).await;
+        }
+    }));
+    // server socket recv → ep_b input
+    let s = Arc::clone(&server_sock);
+    let ib = input_b.clone();
+    task_handles.push(tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
         loop {
-            tokio::select! {
-                Some(pkt) = out_a.recv() => { let _ = input_b_fwd.send(pkt).await; }
-                Some(pkt) = out_b.recv() => { let _ = input_a_fwd.send(pkt).await; }
+            if let Ok((n, _)) = s.recv_from(&mut buf).await {
+                let _ = ib.send(KcpPacket::from(BytesMut::from(&buf[..n]))).await;
             }
         }
-    });
+    }));
+    // client socket recv → ep_a input
+    let s = Arc::clone(&client_sock);
+    let ia = input_a.clone();
+    task_handles.push(tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            if let Ok((n, _)) = s.recv_from(&mut buf).await {
+                let _ = ia.send(KcpPacket::from(BytesMut::from(&buf[..n]))).await;
+            }
+        }
+    }));
 
     let ep_b = Arc::new(Mutex::new(ep_b));
     let ep_b_echo = Arc::clone(&ep_b);
-    tokio::spawn(async move {
+    task_handles.push(tokio::spawn(async move {
         let conn_id = match ep_b_echo.lock().await.accept().await {
             Ok(c) => c,
             Err(_) => return,
@@ -1451,16 +1516,23 @@ async fn kcp_sys_echo_roundtrip(payload: &[u8]) -> Result<usize> {
             let _ = stream.write_all(&buf[..n]).await;
             let _ = stream.flush().await;
         }
-    });
+    }));
 
     let conn_id = ep_a
         .connect(Duration::from_secs(5), 0, 0, Bytes::new())
         .await?;
     let mut stream = KcpStream::new(&ep_a, conn_id).expect("KcpStream");
-    stream.write_all(payload).await?;
-    stream.flush().await?;
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(payload)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
     let mut buf = vec![0u8; payload.len()];
-    stream.read_exact(&mut buf).await?;
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut buf)).await??;
+
+    // Abort all forwarding/echo tasks so their sockets are released immediately,
+    // preventing interference with the next iteration.
+    for h in task_handles {
+        h.abort();
+    }
+
     Ok(buf.len())
 }
 
@@ -1471,9 +1543,9 @@ fn bench_kcp_sys_throughput(c: &mut Criterion) {
 
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("kcp_sys_throughput");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
@@ -1500,9 +1572,9 @@ fn bench_kcp_sys_latency(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let payload = [0xABu8; 64];
     let mut group = c.benchmark_group("kcp_sys_latency");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     group.bench_function("echo_rtt_64b", |b| {
         b.iter(|| {
             let n = rt.block_on(kcp_sys_echo_roundtrip(&payload)).unwrap_or(0);
@@ -1519,9 +1591,9 @@ fn bench_noop(_: &mut Criterion) {}
 criterion_group! {
     name = benches;
     config = Criterion::default()
-        .warm_up_time(Duration::from_millis(200))
-        .measurement_time(Duration::from_secs(1))
-        .sample_size(15);
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(3))
+        .sample_size(30);
     targets = bench_throughput,
         bench_latency,
         bench_concurrent_connections,
@@ -1540,9 +1612,9 @@ criterion_group! {
 criterion_group! {
     name = ys_kcp_benches;
     config = Criterion::default()
-        .warm_up_time(Duration::from_millis(200))
-        .measurement_time(Duration::from_secs(1))
-        .sample_size(15);
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(3))
+        .sample_size(30);
     targets = bench_ys_kcp_throughput,
         bench_ys_kcp_latency,
         bench_ys_kcp_concurrent
@@ -1559,9 +1631,9 @@ criterion_group! {
 criterion_group! {
     name = kcp_sys_benches;
     config = Criterion::default()
-        .warm_up_time(Duration::from_millis(200))
-        .measurement_time(Duration::from_secs(1))
-        .sample_size(15);
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(3))
+        .sample_size(30);
     targets = bench_kcp_sys_throughput,
         bench_kcp_sys_latency
 }
@@ -1681,8 +1753,9 @@ async fn slipstream_echo_roundtrips_one_connection(
 criterion_group! {
     name = slipstream_benches;
     config = Criterion::default()
-        .warm_up_time(Duration::from_millis(200))
-        .measurement_time(Duration::from_secs(1));
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(3))
+        .sample_size(30);
     targets = bench_slipstream_throughput,
         bench_slipstream_latency,
         bench_slipstream_concurrent
@@ -1704,9 +1777,9 @@ fn bench_slipstream_throughput(c: &mut Criterion) {
         start_slipstream_echo_server_in_background(&rt, Some((cert_path.clone(), key_path)));
     let cert_path_ref = cert_file.path();
     let mut group = c.benchmark_group("slipstream_throughput");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     for size in [64, 256, 1024, 4096, 8192] {
         let total_bytes = (size as u64) * (SLIPSTREAM_THROUGHPUT_ROUNDTRIPS as u64);
         group.throughput(Throughput::Bytes(total_bytes));
@@ -1772,9 +1845,9 @@ fn bench_slipstream_latency(c: &mut Criterion) {
         start_slipstream_echo_server_in_background(&rt, Some((cert_path, key_path)));
     let cert_path_ref = cert_file.path();
     let mut group = c.benchmark_group("slipstream_latency");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     let payload = [0xABu8; 64];
     group.bench_function("echo_rtt_64b", |b| {
         b.iter(|| {
@@ -1807,9 +1880,9 @@ fn bench_slipstream_concurrent(c: &mut Criterion) {
     proxy_server::transport::ensure_slipstream_picoquic_tls_init();
     let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("slipstream_concurrent");
-    group.warm_up_time(Duration::from_millis(200));
-    group.measurement_time(Duration::from_secs(1));
-    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(30);
     let payload = [0xABu8; 64];
     let mut server_guard: Option<tokio::sync::broadcast::Sender<()>> = None;
     for num_conns in [5, 10, 20] {
