@@ -30,6 +30,8 @@ use tracing::info;
 const KCP_OVERHEAD: usize = 24;
 #[cfg(feature = "ys-kcp")]
 const KCP_OVERHEAD_YS: usize = 28; // ys-kcp has token field
+#[cfg(feature = "ys-kcp")]
+const YS_KCP_SLEEP_US: u64 = 200; // bounded wait per iteration; matches kcp_deepseek/kcprs
 
 /// Log file for success rate: one line per iteration "group\tfunction\tsuccess" (success 0 or 1).
 static BENCH_SUCCESS_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
@@ -303,7 +305,6 @@ fn ys_kcp_echo_roundtrip_udp(
 
     current += 5;
 
-    const YS_KCP_SLEEP_US: u64 = 200; // bounded wait per iteration; matches kcp_deepseek/kcprs
     for _ in 0..max_iter {
         std::thread::sleep(Duration::from_micros(YS_KCP_SLEEP_US)); // Bounded wait
                                                                     // ys-kcp: update first so current is set and flush runs (matches in-memory loop and update() doc)
@@ -502,6 +503,239 @@ fn current_ms() -> u32 {
         .as_millis() as u32
 }
 
+// ---- kcp_deepseek persistent state (for throughput bench connection reuse) ----
+
+struct KcpDeepseekPersistentState {
+    client_socket: Rc<UdpSocket>,
+    server_socket: Rc<UdpSocket>,
+    server_addr: SocketAddr,
+    server_buf: Rc<RefCell<Vec<u8>>>,
+    server_peer: Rc<RefCell<Option<SocketAddr>>>,
+    kcp_a: kcp_deepseek::Kcp<ClientUdpWriter>,
+    kcp_b: kcp_deepseek::Kcp<ServerUdpWriter>,
+}
+
+fn kcp_deepseek_init_persistent(init_ms: u32) -> Result<KcpDeepseekPersistentState> {
+    let server_socket = Rc::new(UdpSocket::bind("127.0.0.1:0")?);
+    let server_addr = server_socket.local_addr()?;
+    server_socket.set_read_timeout(Some(UDP_READ_TIMEOUT))?;
+    server_socket.set_nonblocking(true)?;
+
+    let client_socket = Rc::new(UdpSocket::bind("127.0.0.1:0")?);
+    client_socket.set_read_timeout(Some(UDP_READ_TIMEOUT))?;
+    client_socket.set_nonblocking(true)?;
+
+    let conv = 1u32;
+    let server_buf = Rc::new(RefCell::new(Vec::new()));
+    let server_peer = Rc::new(RefCell::new(None::<SocketAddr>));
+
+    let mut kcp_a = kcp_deepseek::Kcp::new_stream(
+        conv,
+        ClientUdpWriter {
+            socket: Rc::clone(&client_socket),
+            peer: server_addr,
+        },
+    );
+    let mut kcp_b = kcp_deepseek::Kcp::new_stream(
+        conv,
+        ServerUdpWriter {
+            socket: Rc::clone(&server_socket),
+            buffer: Rc::clone(&server_buf),
+            peer: Rc::clone(&server_peer),
+        },
+    );
+
+    kcp_a.set_mtu(1400)?;
+    kcp_b.set_mtu(1400)?;
+    kcp_a.set_wndsize(128, 128);
+    kcp_b.set_wndsize(128, 128);
+    kcp_a.set_nodelay(true, 20, 2, true);
+    kcp_b.set_nodelay(true, 20, 2, true);
+
+    kcp_a.update(init_ms)?;
+    kcp_b.update(init_ms)?;
+
+    Ok(KcpDeepseekPersistentState {
+        client_socket,
+        server_socket,
+        server_addr,
+        server_buf,
+        server_peer,
+        kcp_a,
+        kcp_b,
+    })
+}
+
+fn kcp_deepseek_persistent_roundtrip(
+    state: &mut KcpDeepseekPersistentState,
+    payload: &[u8],
+) -> Result<usize> {
+    let mut current = current_ms();
+
+    state.kcp_a.send(payload)?;
+    state.kcp_a.update(current)?;
+    state.kcp_b.update(current)?;
+    state.kcp_a.flush()?;
+
+    current += 5;
+    let mut recv_len = 0usize;
+    let mut buf = vec![0u8; payload.len() + 2048];
+
+    for _ in 0..KCP_UDP_MAX_ITER {
+        std::thread::sleep(Duration::from_micros(200));
+        if let Ok((n, from)) = state.server_socket.recv_from(&mut buf) {
+            let server_writer = ServerUdpWriter {
+                socket: Rc::clone(&state.server_socket),
+                buffer: Rc::clone(&state.server_buf),
+                peer: Rc::clone(&state.server_peer),
+            };
+            server_writer.send_buffered(from)?;
+            state.kcp_b.input(&buf[..n])?;
+        }
+        if let Ok((n, _)) = state.client_socket.recv_from(&mut buf) {
+            state.kcp_a.input(&buf[..n])?;
+        }
+
+        state.kcp_a.update(current)?;
+        state.kcp_b.update(current)?;
+
+        if let Ok(n) = state.kcp_b.recv(&mut buf) {
+            let _ = state.kcp_b.send(&buf[..n]);
+            state.kcp_b.flush().ok();
+        }
+
+        if let Ok(n) = state.kcp_a.recv(&mut buf) {
+            recv_len = n;
+            break;
+        }
+        current += 5;
+    }
+    Ok(recv_len)
+}
+
+// ---- kcprs persistent state (for throughput bench connection reuse) ----
+
+struct KcprsPersistentState {
+    client_socket: UdpSocket,
+    server_socket: UdpSocket,
+    server_addr: SocketAddr,
+    kcp_a: kcprs::Kcp,
+    kcp_b: kcprs::Kcp,
+    client_addr: Option<SocketAddr>,
+}
+
+fn kcprs_init_persistent(init_ms: u32) -> Result<KcprsPersistentState> {
+    let server_socket = UdpSocket::bind("127.0.0.1:0")?;
+    let server_addr = server_socket.local_addr()?;
+    server_socket.set_read_timeout(Some(UDP_READ_TIMEOUT))?;
+    server_socket.set_nonblocking(true)?;
+
+    let client_socket = UdpSocket::bind("127.0.0.1:0")?;
+    client_socket.set_read_timeout(Some(UDP_READ_TIMEOUT))?;
+    client_socket.set_nonblocking(true)?;
+
+    KCPRS_BUF_A_TO_B.with(|c| c.borrow_mut().clear());
+    KCPRS_BUF_B_TO_A.with(|c| c.borrow_mut().clear());
+
+    let conv = 1u32;
+    let mut kcp_a = kcprs::Kcp::new_stream(conv, kcprs_output_a_to_b);
+    let mut kcp_b = kcprs::Kcp::new_stream(conv, kcprs_output_b_to_a);
+
+    kcp_a.set_mtu(1400)?;
+    kcp_b.set_mtu(1400)?;
+    kcp_a.set_wndsize(128, 128);
+    kcp_b.set_wndsize(128, 128);
+    kcp_a.set_nodelay(true, 20, 2, true);
+    kcp_b.set_nodelay(true, 20, 2, true);
+
+    kcp_a.update(init_ms)?;
+    kcp_b.update(init_ms)?;
+
+    Ok(KcprsPersistentState {
+        client_socket,
+        server_socket,
+        server_addr,
+        kcp_a,
+        kcp_b,
+        client_addr: None,
+    })
+}
+
+fn kcprs_persistent_roundtrip(state: &mut KcprsPersistentState, payload: &[u8]) -> Result<usize> {
+    let mut current = current_ms();
+
+    KCPRS_BUF_A_TO_B.with(|c| c.borrow_mut().clear());
+    KCPRS_BUF_B_TO_A.with(|c| c.borrow_mut().clear());
+
+    state.kcp_a.send(payload)?;
+    state.kcp_a.update(current)?;
+    state.kcp_b.update(current)?;
+    state.kcp_a.flush()?;
+
+    let mut recv_len = 0usize;
+    let mut buf = vec![0u8; payload.len() + 2048];
+
+    for _ in 0..KCP_UDP_MAX_ITER {
+        std::thread::sleep(Duration::from_micros(200));
+        state.kcp_a.update(current)?;
+        state.kcp_b.update(current)?;
+
+        KCPRS_BUF_A_TO_B.with(|cell| {
+            let ab = cell.borrow_mut();
+            if !ab.is_empty() {
+                for _ in 0..10 {
+                    match state.client_socket.send_to(&ab[..], state.server_addr) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_micros(100));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        });
+        KCPRS_BUF_A_TO_B.with(|cell| cell.borrow_mut().clear());
+
+        KCPRS_BUF_B_TO_A.with(|cell| {
+            let ba = cell.borrow_mut();
+            if !ba.is_empty() {
+                if let Some(peer) = state.client_addr {
+                    for _ in 0..10 {
+                        match state.server_socket.send_to(&ba[..], peer) {
+                            Ok(_) => break,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_micros(100));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+        });
+        KCPRS_BUF_B_TO_A.with(|cell| cell.borrow_mut().clear());
+
+        if let Ok((n, from)) = state.server_socket.recv_from(&mut buf) {
+            state.client_addr = Some(from);
+            state.kcp_b.input(&buf[..n])?;
+        }
+        if let Ok((n, _)) = state.client_socket.recv_from(&mut buf) {
+            state.kcp_a.input(&buf[..n])?;
+        }
+
+        if let Ok(n) = state.kcp_b.recv(&mut buf) {
+            let _ = state.kcp_b.send(&buf[..n]);
+            state.kcp_b.flush().ok();
+        }
+
+        if let Ok(n) = state.kcp_a.recv(&mut buf) {
+            recv_len = n;
+            break;
+        }
+        current += 5;
+    }
+    Ok(recv_len)
+}
+
 static INIT_LOGGING: Once = Once::new();
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(1);
 const IO_TIMEOUT: Duration = Duration::from_millis(800);
@@ -667,6 +901,19 @@ async fn echo_roundtrip(current_addr: &Arc<RwLock<SocketAddr>>, payload: &[u8]) 
     Ok(0)
 }
 
+/// One echo roundtrip on an already-connected KcpStream (no reconnect).
+/// Used in bench_throughput so connect cost is outside the hot path.
+async fn kcp_tokio_stream_roundtrip(
+    stream: &mut kcp_tokio::KcpStream,
+    payload: &[u8],
+) -> Result<usize> {
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(payload)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    let mut buf = vec![0u8; payload.len()];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut buf)).await??;
+    Ok(buf.len())
+}
+
 // ---- quinn (QUIC echo over UDP, TLS) ----
 
 const QUINN_ALPN: &[u8] = b"proxy-echo";
@@ -796,6 +1043,17 @@ async fn quinn_echo_roundtrip(
     Ok(payload.len())
 }
 
+/// One echo roundtrip on an already-established quinn::Connection (no reconnect/TLS).
+/// Opens a new bi-directional stream per roundtrip — standard QUIC multiplexing.
+async fn quinn_connection_roundtrip(conn: &quinn::Connection, payload: &[u8]) -> Result<usize> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    tokio::time::timeout(IO_TIMEOUT, send.write_all(payload)).await??;
+    send.finish()?;
+    let mut buf = vec![0u8; payload.len()];
+    tokio::time::timeout(IO_TIMEOUT, recv.read_exact(&mut buf)).await??;
+    Ok(payload.len())
+}
+
 fn bench_quinn_throughput(c: &mut Criterion) {
     init_bench_logging();
     eprintln!("[bench] === quinn throughput (QUIC echo, 4 payload sizes) ===");
@@ -822,17 +1080,46 @@ fn bench_quinn_throughput(c: &mut Criterion) {
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
-        eprintln!("[bench]   running {} (connect + 1 echo round-trip)", name);
+        eprintln!(
+            "[bench]   running {} (1 echo round-trip, connection reused per payload size)",
+            name
+        );
         let client_endpoint = Arc::clone(&client_endpoint);
         let func_id = name.clone();
+        let payload = vec![0xABu8; size];
+        let conn_cell: RefCell<Option<quinn::Connection>> = RefCell::new(None);
         group.bench_function(name, |b| {
             b.iter(|| {
-                let payload = vec![0xABu8; size];
                 let n = rt.block_on(async {
-                    match quinn_echo_roundtrip(&current_addr, &payload, &client_endpoint).await {
+                    let mut opt = conn_cell.borrow_mut();
+                    if opt.is_none() {
+                        let addr = *current_addr.read().await;
+                        let connecting = match client_endpoint.connect(addr, "localhost") {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("[bench] warning: quinn connect failed: {e}");
+                                return 0;
+                            }
+                        };
+                        match tokio::time::timeout(IO_TIMEOUT, connecting).await {
+                            Ok(Ok(conn)) => {
+                                *opt = Some(conn);
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!("[bench] warning: quinn handshake failed: {e}");
+                                return 0;
+                            }
+                            Err(_) => {
+                                eprintln!("[bench] warning: quinn connect timed out");
+                                return 0;
+                            }
+                        }
+                    }
+                    match quinn_connection_roundtrip(opt.as_ref().unwrap(), &payload).await {
                         Ok(n) => n,
                         Err(e) => {
                             eprintln!("[bench] warning: quinn throughput roundtrip failed: {e}");
+                            *opt = None;
                             0
                         }
                     }
@@ -1029,18 +1316,48 @@ fn bench_throughput(c: &mut Criterion) {
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
-        eprintln!("[bench]   running {} (connect + 1 echo round-trip)", name);
+        eprintln!(
+            "[bench]   running {} (1 echo round-trip, connection reused per payload size)",
+            name
+        );
         info!(bench = %name, size = size, "throughput benchmark starting");
         let group_id = "kcp_tokio_throughput";
         let func_id = name.clone();
+        let payload = vec![0xABu8; size];
+        let stream: RefCell<Option<kcp_tokio::KcpStream>> = RefCell::new(None);
         group.bench_function(name, |b| {
             b.iter(|| {
-                let payload = vec![0xABu8; size];
                 let n = rt.block_on(async {
-                    match echo_roundtrip(&current_addr, &payload).await {
+                    let mut opt = stream.borrow_mut();
+                    if opt.is_none() {
+                        let addr = *current_addr.read().await;
+                        let config = default_kcp_config();
+                        match tokio::time::timeout(
+                            IO_TIMEOUT,
+                            kcp_tokio::KcpStream::connect(addr, config),
+                        )
+                        .await
+                        {
+                            Ok(Ok(s)) => {
+                                *opt = Some(s);
+                            }
+                            Ok(Err(e)) => {
+                                eprintln!("[bench] warning: kcp_tokio connect failed: {e}");
+                                return 0;
+                            }
+                            Err(_) => {
+                                eprintln!("[bench] warning: kcp_tokio connect timed out");
+                                return 0;
+                            }
+                        }
+                    }
+                    match kcp_tokio_stream_roundtrip(opt.as_mut().unwrap(), &payload).await {
                         Ok(n) => n,
                         Err(e) => {
-                            eprintln!("[bench] warning: throughput roundtrip failed: {e}");
+                            eprintln!(
+                                "[bench] warning: kcp_tokio throughput roundtrip failed: {e}"
+                            );
+                            *opt = None;
                             0
                         }
                     }
@@ -1175,11 +1492,23 @@ fn bench_kcp_deepseek_throughput(c: &mut Criterion) {
         let name = format!("echo_{}b", size);
         let group_id = "kcp_deepseek_throughput";
         let func_id = name.clone();
+        let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
+        let state: RefCell<Option<KcpDeepseekPersistentState>> = RefCell::new(None);
         group.bench_function(name, |b| {
-            let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
             b.iter(|| {
-                let base_ms = current_ms();
-                let n = kcp_deepseek_echo_roundtrip_udp(&payload, base_ms).unwrap_or(0);
+                let mut opt = state.borrow_mut();
+                if opt.is_none() {
+                    *opt = Some(
+                        kcp_deepseek_init_persistent(current_ms())
+                            .expect("kcp_deepseek init failed"),
+                    );
+                }
+                let n = kcp_deepseek_persistent_roundtrip(opt.as_mut().unwrap(), &payload)
+                    .unwrap_or_else(|e| {
+                        eprintln!("[bench] warning: kcp_deepseek throughput roundtrip failed: {e}");
+                        *opt = None;
+                        0
+                    });
                 let ok = n > 0;
                 record_bench_success(group_id, &func_id, ok);
                 black_box(n);
@@ -1266,11 +1595,16 @@ fn bench_kcprs_throughput(c: &mut Criterion) {
         let name = format!("echo_{}b", size);
         let group_id = "kcprs_throughput";
         let func_id = name.clone();
+        let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
         group.bench_function(name, |b| {
-            let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
             b.iter(|| {
-                let base_ms = current_ms();
-                let n = kcprs_echo_roundtrip_udp(&payload, base_ms).unwrap_or(0);
+                // kcprs-0.5.0 has a bug in parse_ack(): it iterates `for i in 0..snd_buf.len()`
+                // and calls snd_buf.remove(i) without breaking, so the cached length becomes
+                // stale and subsequent iterations panic with "Out of bounds access". This triggers
+                // on multi-segment payloads (≥ 4096 bytes) where multiple ACKs arrive per
+                // input() call. Because of this crate bug, we cannot reuse state across
+                // iterations and must reinitialize per iteration, same as the latency bench.
+                let n = kcprs_echo_roundtrip_udp(&payload, current_ms()).unwrap_or(0);
                 let ok = n > 0;
                 record_bench_success(group_id, &func_id, ok);
                 black_box(n);
@@ -1342,6 +1676,126 @@ fn bench_kcprs_concurrent(c: &mut Criterion) {
 }
 
 #[cfg(feature = "ys-kcp")]
+struct YsKcpPersistentState {
+    client_socket: Rc<UdpSocket>,
+    server_socket: Rc<UdpSocket>,
+    server_addr: SocketAddr,
+    server_buf: Rc<RefCell<Vec<u8>>>,
+    server_peer: Rc<RefCell<Option<SocketAddr>>>,
+    kcp_a: kcp::Kcp<ClientUdpWriter>,
+    kcp_b: kcp::Kcp<ServerUdpWriter>,
+    server_recv_buf: Vec<u8>,
+}
+
+#[cfg(feature = "ys-kcp")]
+fn ys_kcp_init_persistent(init_ms: u32) -> Result<YsKcpPersistentState> {
+    let server_socket = Rc::new(UdpSocket::bind("127.0.0.1:0")?);
+    let server_addr = server_socket.local_addr()?;
+    server_socket.set_read_timeout(Some(UDP_READ_TIMEOUT))?;
+    server_socket.set_nonblocking(true)?;
+
+    let client_socket = Rc::new(UdpSocket::bind("127.0.0.1:0")?);
+    client_socket.set_read_timeout(Some(UDP_READ_TIMEOUT))?;
+    client_socket.set_nonblocking(true)?;
+
+    let conv = 1u32;
+    let token = 0u32;
+    let server_buf = Rc::new(RefCell::new(Vec::new()));
+    let server_peer = Rc::new(RefCell::new(None::<SocketAddr>));
+
+    let mut kcp_a = kcp::Kcp::new_stream(
+        conv,
+        token,
+        ClientUdpWriter {
+            socket: Rc::clone(&client_socket),
+            peer: server_addr,
+        },
+    );
+    let mut kcp_b = kcp::Kcp::new_stream(
+        conv,
+        token,
+        ServerUdpWriter {
+            socket: Rc::clone(&server_socket),
+            buffer: Rc::clone(&server_buf),
+            peer: Rc::clone(&server_peer),
+        },
+    );
+
+    kcp_a.set_mtu(1400)?;
+    kcp_b.set_mtu(1400)?;
+    kcp_a.set_wndsize(128, 128);
+    kcp_b.set_wndsize(128, 128);
+    kcp_a.set_nodelay(true, 20, 2, true);
+    kcp_b.set_nodelay(true, 20, 2, true);
+
+    kcp_a.update(init_ms)?;
+
+    Ok(YsKcpPersistentState {
+        client_socket,
+        server_socket,
+        server_addr,
+        server_buf,
+        server_peer,
+        kcp_a,
+        kcp_b,
+        server_recv_buf: Vec::new(),
+    })
+}
+
+#[cfg(feature = "ys-kcp")]
+fn ys_kcp_persistent_roundtrip(state: &mut YsKcpPersistentState, payload: &[u8]) -> Result<usize> {
+    let mut current = current_ms();
+
+    state.kcp_a.send(payload)?;
+    state.kcp_a.update(current)?;
+    state.kcp_a.flush()?;
+
+    current += 5;
+
+    let mut recv_len = 0usize;
+    let mut buf = vec![0u8; payload.len() + 2048];
+    let mut server_pkt = vec![0u8; 1500];
+
+    for _ in 0..KCP_UDP_MAX_ITER {
+        std::thread::sleep(Duration::from_micros(YS_KCP_SLEEP_US));
+        state.kcp_a.update(current)?;
+        state.kcp_b.update(current)?;
+
+        if let Ok((n, from)) = state.server_socket.recv_from(&mut server_pkt) {
+            let server_writer = ServerUdpWriter {
+                socket: Rc::clone(&state.server_socket),
+                buffer: Rc::clone(&state.server_buf),
+                peer: Rc::clone(&state.server_peer),
+            };
+            server_writer.send_buffered(from)?;
+            state.server_recv_buf.extend_from_slice(&server_pkt[..n]);
+            feed_packets_to_ys_kcp(&mut state.server_recv_buf, &mut state.kcp_b)?;
+        }
+        if let Ok((n, _)) = state.client_socket.recv_from(&mut buf) {
+            state.kcp_a.input(&buf[..n])?;
+        }
+
+        if let Ok(n) = state.kcp_b.recv(&mut buf) {
+            if n > 0 {
+                let _ = state.kcp_b.send(&buf[..n]);
+                state.kcp_b.flush().ok();
+                state.kcp_b.update(current).ok();
+            }
+        }
+
+        state.kcp_a.update(current).ok();
+        if let Ok(n) = state.kcp_a.recv(&mut buf) {
+            if n > 0 {
+                recv_len = n;
+                break;
+            }
+        }
+        current += 5;
+    }
+    Ok(recv_len)
+}
+
+#[cfg(feature = "ys-kcp")]
 fn bench_ys_kcp_throughput(c: &mut Criterion) {
     init_bench_logging();
     eprintln!("[bench] === ys_kcp throughput (UDP localhost) ===");
@@ -1355,11 +1809,20 @@ fn bench_ys_kcp_throughput(c: &mut Criterion) {
         let name = format!("echo_{}b", size);
         let group_id = "ys_kcp_throughput";
         let func_id = name.clone();
+        let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
+        let state: RefCell<Option<YsKcpPersistentState>> = RefCell::new(None);
         group.bench_function(name, |b| {
-            let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
             b.iter(|| {
-                let base_ms = current_ms();
-                let n = ys_kcp_echo_roundtrip_udp(&payload, base_ms, None).unwrap_or(0);
+                let mut opt = state.borrow_mut();
+                if opt.is_none() {
+                    *opt = Some(ys_kcp_init_persistent(current_ms()).expect("ys_kcp init failed"));
+                }
+                let n = ys_kcp_persistent_roundtrip(opt.as_mut().unwrap(), &payload)
+                    .unwrap_or_else(|e| {
+                        eprintln!("[bench] warning: ys_kcp throughput roundtrip failed: {e}");
+                        *opt = None;
+                        0
+                    });
                 let ok = n > 0;
                 record_bench_success(group_id, &func_id, ok);
                 black_box(n);
@@ -1540,6 +2003,136 @@ async fn kcp_sys_echo_roundtrip(payload: &[u8]) -> Result<usize> {
     Ok(buf.len())
 }
 
+/// Persistent state for kcp_sys throughput bench: endpoints, forwarding tasks, and server echo
+/// task kept alive across b.iter() calls so only per-stream connect is in the hot path.
+#[cfg(feature = "kcp-sys")]
+struct KcpSysPersistentState {
+    ep_a: kcp_sys::endpoint::KcpEndpoint,
+    /// Keep task handles alive so forwarding and server echo tasks keep running.
+    _task_handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "kcp-sys")]
+async fn kcp_sys_init_persistent() -> Result<KcpSysPersistentState> {
+    use bytes::{Bytes, BytesMut};
+    use kcp_sys::endpoint::KcpEndpoint;
+    use kcp_sys::packet_def::KcpPacket;
+    use kcp_sys::stream::KcpStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UdpSocket;
+    use tokio::sync::Mutex;
+
+    let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+    let server_addr = server_sock.local_addr()?;
+    let client_addr = client_sock.local_addr()?;
+
+    let mut ep_a = KcpEndpoint::new();
+    let mut ep_b = KcpEndpoint::new();
+    let mut out_a = ep_a.output_receiver().take().expect("output receiver");
+    let mut out_b = ep_b.output_receiver().take().expect("output receiver");
+    let input_a = ep_a.input_sender();
+    let input_b = ep_b.input_sender();
+    ep_a.run().await;
+    ep_b.run().await;
+
+    let mut task_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // ep_a output → UDP → server
+    let s = Arc::clone(&client_sock);
+    task_handles.push(tokio::spawn(async move {
+        while let Some(pkt) = out_a.recv().await {
+            let bytes: Bytes = pkt.into();
+            let _ = s.send_to(&bytes, server_addr).await;
+        }
+    }));
+    // ep_b output → UDP → client
+    let s = Arc::clone(&server_sock);
+    task_handles.push(tokio::spawn(async move {
+        while let Some(pkt) = out_b.recv().await {
+            let bytes: Bytes = pkt.into();
+            let _ = s.send_to(&bytes, client_addr).await;
+        }
+    }));
+    // server socket recv → ep_b input
+    let s = Arc::clone(&server_sock);
+    let ib = input_b.clone();
+    task_handles.push(tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            if let Ok((n, _)) = s.recv_from(&mut buf).await {
+                let _ = ib.send(KcpPacket::from(BytesMut::from(&buf[..n]))).await;
+            }
+        }
+    }));
+    // client socket recv → ep_a input
+    let s = Arc::clone(&client_sock);
+    let ia = input_a.clone();
+    task_handles.push(tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            if let Ok((n, _)) = s.recv_from(&mut buf).await {
+                let _ = ia.send(KcpPacket::from(BytesMut::from(&buf[..n]))).await;
+            }
+        }
+    }));
+
+    // Persistent server echo task: loops on accept() for the lifetime of this state.
+    let ep_b = Arc::new(Mutex::new(ep_b));
+    let ep_b_echo = Arc::clone(&ep_b);
+    task_handles.push(tokio::spawn(async move {
+        loop {
+            let conn_id = match ep_b_echo.lock().await.accept().await {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            let ep = Arc::clone(&ep_b_echo);
+            tokio::spawn(async move {
+                let mut stream = match KcpStream::new(&*ep.lock().await, conn_id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let mut buf = vec![0u8; 65536];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let _ = stream.write_all(&buf[..n]).await;
+                    let _ = stream.flush().await;
+                }
+            });
+        }
+    }));
+
+    Ok(KcpSysPersistentState {
+        ep_a,
+        _task_handles: task_handles,
+    })
+}
+
+/// One roundtrip on a pre-existing ep_a. Opens a new KcpStream (cheap) per iteration;
+/// endpoints, sockets, and forwarding tasks are reused.
+#[cfg(feature = "kcp-sys")]
+async fn kcp_sys_persistent_roundtrip(
+    state: &mut KcpSysPersistentState,
+    payload: &[u8],
+) -> Result<usize> {
+    use bytes::Bytes;
+    use kcp_sys::stream::KcpStream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let conn_id = state
+        .ep_a
+        .connect(Duration::from_secs(5), 0, 0, Bytes::new())
+        .await?;
+    let mut stream = KcpStream::new(&state.ep_a, conn_id).expect("KcpStream");
+    tokio::time::timeout(IO_TIMEOUT, stream.write_all(payload)).await??;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+    let mut buf = vec![0u8; payload.len()];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut buf)).await??;
+    Ok(buf.len())
+}
+
 #[cfg(feature = "kcp-sys")]
 fn bench_kcp_sys_throughput(c: &mut Criterion) {
     init_bench_logging();
@@ -1558,6 +2151,12 @@ fn bench_kcp_sys_throughput(c: &mut Criterion) {
         let func_id = name.clone();
         group.bench_function(name, |b| {
             b.iter(|| {
+                // kcp-sys uses async endpoints with tokio channels and spawned tasks. The server
+                // echo task (based on ep_b behind Arc<Mutex>) exits after one stream closes, so
+                // subsequent accept() calls on the same ep_b hang indefinitely. Restructuring
+                // the persistent server task to reliably re-accept across iterations requires
+                // deep changes to kcp_sys_echo_roundtrip internals. Per-iteration reinit matches
+                // the latency bench and avoids the zero-success-rate regression.
                 let n = rt.block_on(kcp_sys_echo_roundtrip(&payload)).unwrap_or(0);
                 let ok = n > 0;
                 record_bench_success(group_id, &func_id, ok);
