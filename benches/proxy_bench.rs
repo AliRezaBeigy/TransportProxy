@@ -742,10 +742,6 @@ const IO_TIMEOUT: Duration = Duration::from_millis(800);
 /// Slipstream-picoquic QUIC+TLS handshake can exceed 800ms on some systems; use longer timeout for connect only.
 #[cfg(feature = "slipstream-picoquic")]
 const SLIPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// With 20 concurrent connections on a single-threaded picoquic loop, per-roundtrip latency can
-/// exceed the default 800ms IO_TIMEOUT. Use a longer timeout for the concurrent bench only.
-#[cfg(feature = "slipstream-picoquic")]
-const SLIPSTREAM_CONCURRENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// One echo round-trip per throughput iteration, matching all other implementations.
 /// The connection is reused per payload size (connect once outside b.iter), so handshake
 /// cost is still amortized — only the per-iteration unit is normalized.
@@ -1523,6 +1519,7 @@ fn bench_kcp_deepseek_concurrent(c: &mut Criterion) {
     init_bench_logging();
     eprintln!("[bench] === kcp_deepseek concurrent (5/10/20 × 10 msgs over UDP) ===");
 
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("kcp_deepseek_concurrent");
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
@@ -1535,11 +1532,11 @@ fn bench_kcp_deepseek_concurrent(c: &mut Criterion) {
         group.bench_function(name, |b| {
             b.iter(|| {
                 let base_ms = current_ms();
-                // Spawn one thread per connection so concurrency matches kcp_tokio / quinn.
-                let handles: Vec<_> = (0..num_conns)
-                    .map(|conn| {
+                let ok_count = rt.block_on(async {
+                    let mut handles = Vec::with_capacity(num_conns);
+                    for conn in 0..num_conns {
                         let base = base_ms.wrapping_add((conn as u32).wrapping_mul(5000));
-                        std::thread::spawn(move || {
+                        handles.push(tokio::task::spawn_blocking(move || {
                             (0..10)
                                 .filter(|_| {
                                     kcp_deepseek_echo_roundtrip_udp(&payload, base)
@@ -1547,10 +1544,14 @@ fn bench_kcp_deepseek_concurrent(c: &mut Criterion) {
                                         .unwrap_or(false)
                                 })
                                 .count()
-                        })
-                    })
-                    .collect();
-                let ok_count: usize = handles.into_iter().map(|h| h.join().unwrap_or(0)).sum();
+                        }));
+                    }
+                    let mut total = 0usize;
+                    for h in handles {
+                        total += h.await.unwrap_or(0);
+                    }
+                    total
+                });
                 let ok = ok_count == num_conns * 10;
                 record_bench_success(group_id, &func_id, ok);
             })
@@ -1590,26 +1591,46 @@ fn bench_kcprs_throughput(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
     group.sample_size(30);
-    for size in [64, 256, 1024, 4096, 8192] {
+    // kcprs-0.5.0 parse_ack() panics on multi-segment payloads (≥ 4096b at MTU 1400) due to an
+    // out-of-bounds bug: it iterates `for i in 0..snd_buf.len()` and calls snd_buf.remove(i)
+    // without breaking, so the cached length becomes stale. Sizes ≥ 4096b are skipped here
+    // rather than crashing the bench runner. Single-segment sizes (≤ 1024b) reuse state
+    // normally, matching the pattern of all other implementations.
+    for size in [64, 256, 1024] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
+        eprintln!(
+            "[bench]   running {} (1 echo round-trip, connection reused per payload size)",
+            name
+        );
         let group_id = "kcprs_throughput";
         let func_id = name.clone();
         let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
+        let state: RefCell<Option<KcprsPersistentState>> = RefCell::new(None);
         group.bench_function(name, |b| {
             b.iter(|| {
-                // kcprs-0.5.0 has a bug in parse_ack(): it iterates `for i in 0..snd_buf.len()`
-                // and calls snd_buf.remove(i) without breaking, so the cached length becomes
-                // stale and subsequent iterations panic with "Out of bounds access". This triggers
-                // on multi-segment payloads (≥ 4096 bytes) where multiple ACKs arrive per
-                // input() call. Because of this crate bug, we cannot reuse state across
-                // iterations and must reinitialize per iteration, same as the latency bench.
-                let n = kcprs_echo_roundtrip_udp(&payload, current_ms()).unwrap_or(0);
+                let mut opt = state.borrow_mut();
+                if opt.is_none() {
+                    *opt = Some(kcprs_init_persistent(current_ms()).expect("kcprs init failed"));
+                }
+                let n = kcprs_persistent_roundtrip(opt.as_mut().unwrap(), &payload).unwrap_or_else(
+                    |e| {
+                        eprintln!("[bench] warning: kcprs throughput roundtrip failed: {e}");
+                        *opt = None;
+                        0
+                    },
+                );
                 let ok = n > 0;
                 record_bench_success(group_id, &func_id, ok);
                 black_box(n);
             })
         });
+    }
+    for size in [4096usize, 8192] {
+        eprintln!(
+            "[bench]   skipping echo_{}b — kcprs-0.5.0 panics on multi-segment payloads (parse_ack bug)",
+            size
+        );
     }
     group.finish();
 }
@@ -1639,6 +1660,7 @@ fn bench_kcprs_concurrent(c: &mut Criterion) {
     init_bench_logging();
     eprintln!("[bench] === kcprs concurrent (5/10/20 × 10 msgs over UDP) ===");
 
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("kcprs_concurrent");
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
@@ -1651,11 +1673,11 @@ fn bench_kcprs_concurrent(c: &mut Criterion) {
         group.bench_function(name, |b| {
             b.iter(|| {
                 let base_ms = current_ms();
-                // Spawn one thread per connection so concurrency matches kcp_tokio / quinn.
-                let handles: Vec<_> = (0..num_conns)
-                    .map(|conn| {
+                let ok_count = rt.block_on(async {
+                    let mut handles = Vec::with_capacity(num_conns);
+                    for conn in 0..num_conns {
                         let base = base_ms.wrapping_add((conn as u32).wrapping_mul(5000));
-                        std::thread::spawn(move || {
+                        handles.push(tokio::task::spawn_blocking(move || {
                             (0..10)
                                 .filter(|_| {
                                     kcprs_echo_roundtrip_udp(&payload, base)
@@ -1663,10 +1685,14 @@ fn bench_kcprs_concurrent(c: &mut Criterion) {
                                         .unwrap_or(false)
                                 })
                                 .count()
-                        })
-                    })
-                    .collect();
-                let ok_count: usize = handles.into_iter().map(|h| h.join().unwrap_or(0)).sum();
+                        }));
+                    }
+                    let mut total = 0usize;
+                    for h in handles {
+                        total += h.await.unwrap_or(0);
+                    }
+                    total
+                });
                 let ok = ok_count == num_conns * 10;
                 record_bench_success(group_id, &func_id, ok);
             })
@@ -1859,6 +1885,7 @@ fn bench_ys_kcp_concurrent(c: &mut Criterion) {
     init_bench_logging();
     eprintln!("[bench] === ys_kcp concurrent (5/10/20 × 10 msgs over UDP) ===");
 
+    let rt = Runtime::new().unwrap();
     let mut group = c.benchmark_group("ys_kcp_concurrent");
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
@@ -1871,11 +1898,11 @@ fn bench_ys_kcp_concurrent(c: &mut Criterion) {
         group.bench_function(name, |b| {
             b.iter(|| {
                 let base_ms = current_ms();
-                // Spawn one thread per connection so concurrency matches kcp_tokio / quinn.
-                let handles: Vec<_> = (0..num_conns)
-                    .map(|conn| {
+                let ok_count = rt.block_on(async {
+                    let mut handles = Vec::with_capacity(num_conns);
+                    for conn in 0..num_conns {
                         let base = base_ms.wrapping_add((conn as u32).wrapping_mul(5000));
-                        std::thread::spawn(move || {
+                        handles.push(tokio::task::spawn_blocking(move || {
                             (0..10)
                                 .filter(|_| {
                                     ys_kcp_echo_roundtrip_udp(&payload, base, None)
@@ -1883,10 +1910,14 @@ fn bench_ys_kcp_concurrent(c: &mut Criterion) {
                                         .unwrap_or(false)
                                 })
                                 .count()
-                        })
-                    })
-                    .collect();
-                let ok_count: usize = handles.into_iter().map(|h| h.join().unwrap_or(0)).sum();
+                        }));
+                    }
+                    let mut total = 0usize;
+                    for h in handles {
+                        total += h.await.unwrap_or(0);
+                    }
+                    total
+                });
                 let ok = ok_count == num_conns * 10;
                 record_bench_success(group_id, &func_id, ok);
             })
@@ -2020,7 +2051,6 @@ async fn kcp_sys_init_persistent() -> Result<KcpSysPersistentState> {
     use kcp_sys::stream::KcpStream;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UdpSocket;
-    use tokio::sync::Mutex;
 
     let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
@@ -2078,20 +2108,21 @@ async fn kcp_sys_init_persistent() -> Result<KcpSysPersistentState> {
     }));
 
     // Persistent server echo task: loops on accept() for the lifetime of this state.
-    let ep_b = Arc::new(Mutex::new(ep_b));
-    let ep_b_echo = Arc::clone(&ep_b);
+    // ep_b is moved directly into the task — no Mutex needed because accept() and
+    // KcpStream::new() are both called from the same task without re-entrancy.
+    // KcpStream::new() only borrows ep_b to extract channel handles, so it is safe
+    // to call immediately after accept() returns without holding any lock.
     task_handles.push(tokio::spawn(async move {
         loop {
-            let conn_id = match ep_b_echo.lock().await.accept().await {
+            let conn_id = match ep_b.accept().await {
                 Ok(c) => c,
                 Err(_) => break,
             };
-            let ep = Arc::clone(&ep_b_echo);
+            let mut stream = match KcpStream::new(&ep_b, conn_id) {
+                Some(s) => s,
+                None => continue,
+            };
             tokio::spawn(async move {
-                let mut stream = match KcpStream::new(&*ep.lock().await, conn_id) {
-                    Some(s) => s,
-                    None => return,
-                };
                 let mut buf = vec![0u8; 65536];
                 while let Ok(n) = stream.read(&mut buf).await {
                     if n == 0 {
@@ -2146,18 +2177,38 @@ fn bench_kcp_sys_throughput(c: &mut Criterion) {
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
+        eprintln!(
+            "[bench]   running {} (1 echo round-trip, connection reused per payload size)",
+            name
+        );
         let payload: Vec<u8> = (0..size).map(|i| (i & 0xFF) as u8).collect();
         let group_id = "kcp_sys_throughput";
         let func_id = name.clone();
+        let state: RefCell<Option<KcpSysPersistentState>> = RefCell::new(None);
         group.bench_function(name, |b| {
             b.iter(|| {
-                // kcp-sys uses async endpoints with tokio channels and spawned tasks. The server
-                // echo task (based on ep_b behind Arc<Mutex>) exits after one stream closes, so
-                // subsequent accept() calls on the same ep_b hang indefinitely. Restructuring
-                // the persistent server task to reliably re-accept across iterations requires
-                // deep changes to kcp_sys_echo_roundtrip internals. Per-iteration reinit matches
-                // the latency bench and avoids the zero-success-rate regression.
-                let n = rt.block_on(kcp_sys_echo_roundtrip(&payload)).unwrap_or(0);
+                let n = rt.block_on(async {
+                    let mut opt = state.borrow_mut();
+                    if opt.is_none() {
+                        match kcp_sys_init_persistent().await {
+                            Ok(s) => {
+                                *opt = Some(s);
+                            }
+                            Err(e) => {
+                                eprintln!("[bench] warning: kcp_sys init failed: {e}");
+                                return 0;
+                            }
+                        }
+                    }
+                    match kcp_sys_persistent_roundtrip(opt.as_mut().unwrap(), &payload).await {
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("[bench] warning: kcp_sys throughput roundtrip failed: {e}");
+                            *opt = None;
+                            0
+                        }
+                    }
+                });
                 let ok = n > 0;
                 record_bench_success(group_id, &func_id, ok);
                 black_box(n);
@@ -2356,13 +2407,9 @@ async fn slipstream_echo_roundtrips_one_connection(
     .await??;
     let mut buf = vec![0u8; payload.len()];
     for _ in 0..count {
-        tokio::time::timeout(SLIPSTREAM_CONCURRENT_IO_TIMEOUT, stream.write_all(payload)).await??;
-        tokio::time::timeout(SLIPSTREAM_CONCURRENT_IO_TIMEOUT, stream.flush()).await??;
-        tokio::time::timeout(
-            SLIPSTREAM_CONCURRENT_IO_TIMEOUT,
-            stream.read_exact(&mut buf),
-        )
-        .await??;
+        tokio::time::timeout(IO_TIMEOUT, stream.write_all(payload)).await??;
+        tokio::time::timeout(IO_TIMEOUT, stream.flush()).await??;
+        tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut buf)).await??;
     }
     Ok(())
 }
