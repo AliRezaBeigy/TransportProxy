@@ -1087,8 +1087,8 @@ fn bench_quinn_throughput(c: &mut Criterion) {
         group.bench_function(name, |b| {
             b.iter(|| {
                 let n = rt.block_on(async {
-                    let mut opt = conn_cell.borrow_mut();
-                    if opt.is_none() {
+                    let mut conn = conn_cell.borrow_mut().take();
+                    if conn.is_none() {
                         let addr = *current_addr.read().await;
                         let connecting = match client_endpoint.connect(addr, "localhost") {
                             Ok(c) => c,
@@ -1098,8 +1098,8 @@ fn bench_quinn_throughput(c: &mut Criterion) {
                             }
                         };
                         match tokio::time::timeout(IO_TIMEOUT, connecting).await {
-                            Ok(Ok(conn)) => {
-                                *opt = Some(conn);
+                            Ok(Ok(c)) => {
+                                conn = Some(c);
                             }
                             Ok(Err(e)) => {
                                 eprintln!("[bench] warning: quinn handshake failed: {e}");
@@ -1111,11 +1111,14 @@ fn bench_quinn_throughput(c: &mut Criterion) {
                             }
                         }
                     }
-                    match quinn_connection_roundtrip(opt.as_ref().unwrap(), &payload).await {
-                        Ok(n) => n,
+                    let result = quinn_connection_roundtrip(conn.as_ref().unwrap(), &payload).await;
+                    match result {
+                        Ok(n) => {
+                            *conn_cell.borrow_mut() = conn;
+                            n
+                        }
                         Err(e) => {
                             eprintln!("[bench] warning: quinn throughput roundtrip failed: {e}");
-                            *opt = None;
                             0
                         }
                     }
@@ -1324,8 +1327,8 @@ fn bench_throughput(c: &mut Criterion) {
         group.bench_function(name, |b| {
             b.iter(|| {
                 let n = rt.block_on(async {
-                    let mut opt = stream.borrow_mut();
-                    if opt.is_none() {
+                    let mut s = stream.borrow_mut().take();
+                    if s.is_none() {
                         let addr = *current_addr.read().await;
                         let config = default_kcp_config();
                         match tokio::time::timeout(
@@ -1334,8 +1337,8 @@ fn bench_throughput(c: &mut Criterion) {
                         )
                         .await
                         {
-                            Ok(Ok(s)) => {
-                                *opt = Some(s);
+                            Ok(Ok(kcp_s)) => {
+                                s = Some(kcp_s);
                             }
                             Ok(Err(e)) => {
                                 eprintln!("[bench] warning: kcp_tokio connect failed: {e}");
@@ -1347,13 +1350,16 @@ fn bench_throughput(c: &mut Criterion) {
                             }
                         }
                     }
-                    match kcp_tokio_stream_roundtrip(opt.as_mut().unwrap(), &payload).await {
-                        Ok(n) => n,
+                    let result = kcp_tokio_stream_roundtrip(s.as_mut().unwrap(), &payload).await;
+                    match result {
+                        Ok(n) => {
+                            *stream.borrow_mut() = s;
+                            n
+                        }
                         Err(e) => {
                             eprintln!(
                                 "[bench] warning: kcp_tokio throughput roundtrip failed: {e}"
                             );
-                            *opt = None;
                             0
                         }
                     }

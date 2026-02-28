@@ -451,42 +451,46 @@ mod slipstream_client {
         callback_ctx: *mut std::ffi::c_void,
         _stream_ctx: *mut std::ffi::c_void,
     ) -> c_int {
-        let ctx = &*(callback_ctx as *const ClientBridgeCtx);
-        use picoquic_call_back_event_t::*;
-        match fin_or_event {
-            picoquic_callback_ready => {
-                ctx.cnx.store(cnx, Ordering::Release);
-                let stream_id_local = picoquic_get_next_local_stream_id(cnx, 0);
-                if picoquic_mark_active_stream(cnx, stream_id_local, 1, std::ptr::null_mut()) != 0 {
-                    return -1;
+        unsafe {
+            let ctx = &*(callback_ctx as *const ClientBridgeCtx);
+            use picoquic_call_back_event_t::*;
+            match fin_or_event {
+                picoquic_callback_ready => {
+                    ctx.cnx.store(cnx, Ordering::Release);
+                    let stream_id_local = picoquic_get_next_local_stream_id(cnx, 0);
+                    if picoquic_mark_active_stream(cnx, stream_id_local, 1, std::ptr::null_mut())
+                        != 0
+                    {
+                        return -1;
+                    }
+                    ctx.stream_id.store(stream_id_local, Ordering::Release);
+                    if let Some(ref tx) = ctx.ready_tx {
+                        let _ = tx.try_send(());
+                    }
                 }
-                ctx.stream_id.store(stream_id_local, Ordering::Release);
-                if let Some(ref tx) = ctx.ready_tx {
-                    let _ = tx.try_send(());
+                picoquic_callback_stream_data => {
+                    if !bytes.is_null() && length > 0 {
+                        let slice = std::slice::from_raw_parts(bytes, length);
+                        let v = slice.to_vec();
+                        let _ = ctx.recv_tx.try_send(v);
+                    }
                 }
-            }
-            picoquic_callback_stream_data => {
-                if !bytes.is_null() && length > 0 {
-                    let slice = std::slice::from_raw_parts(bytes, length);
-                    let v = slice.to_vec();
-                    let _ = ctx.recv_tx.try_send(v);
+                picoquic_callback_stream_fin => {
+                    let _ = ctx.recv_tx.try_send(Vec::new());
                 }
+                picoquic_callback_close
+                | picoquic_callback_application_close
+                | picoquic_callback_stateless_reset => {
+                    ctx.disconnected.store(true, Ordering::Release);
+                    let _ = ctx.recv_tx.try_send(Vec::new());
+                }
+                picoquic_callback_stream_reset | picoquic_callback_stop_sending => {
+                    let _ = ctx.recv_tx.try_send(Vec::new());
+                }
+                _ => {}
             }
-            picoquic_callback_stream_fin => {
-                let _ = ctx.recv_tx.try_send(Vec::new());
-            }
-            picoquic_callback_close
-            | picoquic_callback_application_close
-            | picoquic_callback_stateless_reset => {
-                ctx.disconnected.store(true, Ordering::Release);
-                let _ = ctx.recv_tx.try_send(Vec::new());
-            }
-            picoquic_callback_stream_reset | picoquic_callback_stop_sending => {
-                let _ = ctx.recv_tx.try_send(Vec::new());
-            }
-            _ => {}
+            0
         }
-        0
     }
 
     /// SAFETY: callback_ctx is a valid pointer to ClientBridgeCtx; only used until picoquic_packet_loop returns.
@@ -496,139 +500,152 @@ mod slipstream_client {
         callback_ctx: *mut std::ffi::c_void,
         arg: *mut std::ffi::c_void,
     ) -> c_int {
-        let ctx = &*(callback_ctx as *const ClientBridgeCtx);
-        if cb_mode == PICOQUIC_PACKET_LOOP_READY {
-            if !arg.is_null() {
-                let opt = &mut *(arg as *mut picoquic_packet_loop_options_t);
-                opt._flags = 1; /* do_time_check */
-            }
-            return 0;
-        }
-        if cb_mode == PICOQUIC_PACKET_LOOP_TIME_CHECK {
-            /* Always cap idle wait so new writes or abandonment are noticed quickly. */
-            if !arg.is_null() {
-                let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
-                if time_arg.delta_t > 1_000 {
-                    time_arg.delta_t = 1_000;
+        unsafe {
+            let ctx = &*(callback_ctx as *const ClientBridgeCtx);
+            if cb_mode == PICOQUIC_PACKET_LOOP_READY {
+                if !arg.is_null() {
+                    let opt = &mut *(arg as *mut picoquic_packet_loop_options_t);
+                    opt._flags = 1; /* do_time_check */
                 }
+                return 0;
             }
-            /* If the async side abandoned us (recv_tx closed = receiver dropped), schedule close.
-             * We cannot call picoquic_close() here (re-entrancy risk); set a flag and act in AFTER_RECEIVE/AFTER_SEND. */
-            if ctx.recv_tx.is_closed() {
-                ctx.should_close.store(true, Ordering::Release);
-            }
-            if !ctx.cnx.load(Ordering::Acquire).is_null()
-                && ctx.stream_id.load(Ordering::Acquire) != STREAM_ID_NOT_SET
-            {
-                let peek = &mut *ctx.peek_buf.get();
-                if peek.is_none() {
-                    match ctx.send_rx.try_recv() {
-                        Ok(data) => *peek = Some(data),
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            /* send_tx dropped — schedule close; act in AFTER_RECEIVE/AFTER_SEND */
-                            ctx.should_close.store(true, Ordering::Release);
-                        }
-                        Err(mpsc::TryRecvError::Empty) => {}
-                    }
-                }
+            if cb_mode == PICOQUIC_PACKET_LOOP_TIME_CHECK {
+                /* Always cap idle wait so new writes or abandonment are noticed quickly. */
                 if !arg.is_null() {
                     let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
-                    if ctx.should_close.load(Ordering::Acquire) {
-                        /* Force immediate wakeup so AFTER_SEND fires and we can call picoquic_close. */
+                    if time_arg.delta_t > 1_000 {
+                        time_arg.delta_t = 1_000;
+                    }
+                }
+                /* If the async side abandoned us (recv_tx closed = receiver dropped), schedule close.
+                 * We cannot call picoquic_close() here (re-entrancy risk); set a flag and act in AFTER_RECEIVE/AFTER_SEND. */
+                if ctx.recv_tx.is_closed() {
+                    ctx.should_close.store(true, Ordering::Release);
+                }
+                if !ctx.cnx.load(Ordering::Acquire).is_null()
+                    && ctx.stream_id.load(Ordering::Acquire) != STREAM_ID_NOT_SET
+                {
+                    let peek = &mut *ctx.peek_buf.get();
+                    if peek.is_none() {
+                        match ctx.send_rx.try_recv() {
+                            Ok(data) => *peek = Some(data),
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                /* send_tx dropped — schedule close; act in AFTER_RECEIVE/AFTER_SEND */
+                                ctx.should_close.store(true, Ordering::Release);
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
+                    if !arg.is_null() {
+                        let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
+                        if ctx.should_close.load(Ordering::Acquire) {
+                            /* Force immediate wakeup so AFTER_SEND fires and we can call picoquic_close. */
+                            time_arg.delta_t = 0;
+                        } else if peek.is_some() {
+                            time_arg.delta_t = 500; /* 0.5ms — drain immediately */
+                        }
+                    }
+                } else if ctx.should_close.load(Ordering::Acquire) {
+                    /* cnx not yet set or stream not opened but close requested — force wakeup. */
+                    if !arg.is_null() {
+                        let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
                         time_arg.delta_t = 0;
-                    } else if peek.is_some() {
-                        time_arg.delta_t = 500; /* 0.5ms — drain immediately */
                     }
                 }
-            } else if ctx.should_close.load(Ordering::Acquire) {
-                /* cnx not yet set or stream not opened but close requested — force wakeup. */
-                if !arg.is_null() {
-                    let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
-                    time_arg.delta_t = 0;
-                }
+                return 0;
             }
-            return 0;
-        }
-        if cb_mode == PICOQUIC_PACKET_LOOP_AFTER_RECEIVE
-            || cb_mode == PICOQUIC_PACKET_LOOP_AFTER_SEND
-        {
-            /* If TIME_CHECK flagged a close request, call picoquic_close here (safe in AFTER_* callbacks).
-             * Do NOT terminate immediately — let the loop run so CONNECTION_CLOSE is actually transmitted.
-             * We terminate when disconnected=true (set by stream_callback on callback_close/callback_application_close). */
-            if ctx.should_close.load(Ordering::Acquire) {
+            if cb_mode == PICOQUIC_PACKET_LOOP_AFTER_RECEIVE
+                || cb_mode == PICOQUIC_PACKET_LOOP_AFTER_SEND
+            {
+                /* If TIME_CHECK flagged a close request, call picoquic_close here (safe in AFTER_* callbacks).
+                 * Do NOT terminate immediately — let the loop run so CONNECTION_CLOSE is actually transmitted.
+                 * We terminate when disconnected=true (set by stream_callback on callback_close/callback_application_close). */
+                if ctx.should_close.load(Ordering::Acquire) {
+                    let cnx = ctx.cnx.load(Ordering::Acquire);
+                    if ctx.disconnected.load(Ordering::Acquire) {
+                        /* Server acknowledged our close — now safe to exit. */
+                        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                    }
+                    if cnx.is_null() {
+                        /* No connection established yet — just terminate. */
+                        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                    }
+                    if !ctx.close_sent.load(Ordering::Acquire) {
+                        /* Queue CONNECTION_CLOSE; loop continues to transmit it. */
+                        picoquic_close(cnx, 0);
+                        ctx.close_sent.store(true, Ordering::Release);
+                    }
+                    /* Safety: if we've been waiting too long (~5000 AFTER_* callbacks), force terminate. */
+                    let ticks = ctx.close_wait_ticks.fetch_add(1, Ordering::Relaxed);
+                    if ticks > 5000 {
+                        return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
+                    }
+                    return 0; /* Keep looping so the close frame is sent. */
+                }
                 let cnx = ctx.cnx.load(Ordering::Acquire);
-                if ctx.disconnected.load(Ordering::Acquire) {
-                    /* Server acknowledged our close — now safe to exit. */
-                    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
-                }
-                if cnx.is_null() {
-                    /* No connection established yet — just terminate. */
-                    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
-                }
-                if !ctx.close_sent.load(Ordering::Acquire) {
-                    /* Queue CONNECTION_CLOSE; loop continues to transmit it. */
-                    picoquic_close(cnx, 0);
-                    ctx.close_sent.store(true, Ordering::Release);
-                }
-                /* Safety: if we've been waiting too long (~5000 AFTER_* callbacks), force terminate. */
-                let ticks = ctx.close_wait_ticks.fetch_add(1, Ordering::Relaxed);
-                if ticks > 5000 {
-                    return PICOQUIC_NO_ERROR_TERMINATE_PACKET_LOOP;
-                }
-                return 0; /* Keep looping so the close frame is sent. */
-            }
-            let cnx = ctx.cnx.load(Ordering::Acquire);
-            let stream_id = ctx.stream_id.load(Ordering::Acquire);
-            if !cnx.is_null() && stream_id != STREAM_ID_NOT_SET {
-                let mut consumed = false;
-                let peek = &mut *ctx.peek_buf.get();
-                if let Some(data) = peek.take() {
-                    consumed = true;
-                    let fin = if data.is_empty() { 1 } else { 0 };
-                    let len = data.len();
-                    if len == 0 && fin != 0 {
-                        let _ = picoquic_add_to_stream(cnx, stream_id, std::ptr::null(), 0, 1);
-                    } else if !data.is_empty() {
-                        let ret = picoquic_add_to_stream(cnx, stream_id, data.as_ptr(), len, fin);
-                        if ret != 0 {
-                            *peek = Some(data);
-                        }
-                    }
-                }
-                if consumed {
-                    let _ = ctx.wake_tx.try_send(());
-                }
-                while consumed {
-                    match ctx.send_rx.try_recv() {
-                        Ok(data) => {
-                            consumed = true;
-                            let fin = if data.is_empty() { 1 } else { 0 };
-                            let len = data.len();
-                            if len == 0 && fin != 0 {
-                                let _ =
-                                    picoquic_add_to_stream(cnx, stream_id, std::ptr::null(), 0, 1);
-                            } else if !data.is_empty() {
-                                let ret =
-                                    picoquic_add_to_stream(cnx, stream_id, data.as_ptr(), len, fin);
-                                if ret != 0 {
-                                    break;
-                                }
+                let stream_id = ctx.stream_id.load(Ordering::Acquire);
+                if !cnx.is_null() && stream_id != STREAM_ID_NOT_SET {
+                    let mut consumed = false;
+                    let peek = &mut *ctx.peek_buf.get();
+                    if let Some(data) = peek.take() {
+                        consumed = true;
+                        let fin = if data.is_empty() { 1 } else { 0 };
+                        let len = data.len();
+                        if len == 0 && fin != 0 {
+                            let _ = picoquic_add_to_stream(cnx, stream_id, std::ptr::null(), 0, 1);
+                        } else if !data.is_empty() {
+                            let ret =
+                                picoquic_add_to_stream(cnx, stream_id, data.as_ptr(), len, fin);
+                            if ret != 0 {
+                                *peek = Some(data);
                             }
                         }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            /* send_tx dropped — schedule close via should_close flag; loop will transmit then exit */
-                            ctx.should_close.store(true, Ordering::Release);
-                            break;
+                    }
+                    if consumed {
+                        let _ = ctx.wake_tx.try_send(());
+                    }
+                    while consumed {
+                        match ctx.send_rx.try_recv() {
+                            Ok(data) => {
+                                consumed = true;
+                                let fin = if data.is_empty() { 1 } else { 0 };
+                                let len = data.len();
+                                if len == 0 && fin != 0 {
+                                    let _ = picoquic_add_to_stream(
+                                        cnx,
+                                        stream_id,
+                                        std::ptr::null(),
+                                        0,
+                                        1,
+                                    );
+                                } else if !data.is_empty() {
+                                    let ret = picoquic_add_to_stream(
+                                        cnx,
+                                        stream_id,
+                                        data.as_ptr(),
+                                        len,
+                                        fin,
+                                    );
+                                    if ret != 0 {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                /* send_tx dropped — schedule close via should_close flag; loop will transmit then exit */
+                                ctx.should_close.store(true, Ordering::Release);
+                                break;
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
                         }
-                        Err(mpsc::TryRecvError::Empty) => break,
+                    }
+                    if consumed {
+                        let _ = ctx.wake_tx.try_send(());
                     }
                 }
-                if consumed {
-                    let _ = ctx.wake_tx.try_send(());
-                }
             }
+            0
         }
-        0
     }
 
     pub(super) async fn connect_stream(
@@ -1060,75 +1077,77 @@ mod slipstream_server {
         callback_ctx: *mut std::ffi::c_void,
         _stream_ctx: *mut std::ffi::c_void,
     ) -> c_int {
-        let ctx = &*(callback_ctx as *const ServerGlobalCtx);
-        use picoquic_call_back_event_t::*;
-        let key = cnx as usize;
-        match fin_or_event {
-            picoquic_callback_ready => {
-                let mut map = ctx.connections.lock().unwrap();
-                map.insert(
-                    key,
-                    ServerConnState {
-                        cnx,
-                        stream_id: None,
-                        recv_tx: None,
-                        send_rx: None,
-                        wake_tx: None,
-                    },
-                );
-            }
-            picoquic_callback_stream_data => {
-                let mut map = ctx.connections.lock().unwrap();
-                if let Some(state) = map.get_mut(&key) {
-                    if state.stream_id.is_none() {
-                        state.stream_id = Some(stream_id);
-                        let (recv_tx, recv_rx) = tokio_mpsc::channel(4096);
-                        let (send_tx, send_rx) = mpsc::sync_channel(512);
-                        let (wake_tx, wake_rx) = tokio_mpsc::channel(512);
-                        state.recv_tx = Some(recv_tx.clone());
-                        state.send_rx = Some(send_rx);
-                        state.wake_tx = Some(wake_tx);
-                        let read_half = slipstream_client::SlipstreamRecvHalf {
-                            recv_rx,
-                            pending: Vec::new(),
-                            pending_off: 0,
-                        };
-                        let write_half =
-                            slipstream_client::SlipstreamSendHalf::new(send_tx, wake_rx);
-                        let _ = ctx.accept_tx.send((read_half, write_half));
-                        if !bytes.is_null() && length > 0 {
-                            let slice = std::slice::from_raw_parts(bytes, length);
-                            let _ = state.recv_tx.as_ref().unwrap().try_send(slice.to_vec());
-                        }
-                    } else if state.stream_id == Some(stream_id) {
-                        if !bytes.is_null() && length > 0 {
-                            let slice = std::slice::from_raw_parts(bytes, length);
-                            if let Some(ref tx) = state.recv_tx {
-                                let _ = tx.try_send(slice.to_vec());
+        unsafe {
+            let ctx = &*(callback_ctx as *const ServerGlobalCtx);
+            use picoquic_call_back_event_t::*;
+            let key = cnx as usize;
+            match fin_or_event {
+                picoquic_callback_ready => {
+                    let mut map = ctx.connections.lock().unwrap();
+                    map.insert(
+                        key,
+                        ServerConnState {
+                            cnx,
+                            stream_id: None,
+                            recv_tx: None,
+                            send_rx: None,
+                            wake_tx: None,
+                        },
+                    );
+                }
+                picoquic_callback_stream_data => {
+                    let mut map = ctx.connections.lock().unwrap();
+                    if let Some(state) = map.get_mut(&key) {
+                        if state.stream_id.is_none() {
+                            state.stream_id = Some(stream_id);
+                            let (recv_tx, recv_rx) = tokio_mpsc::channel(4096);
+                            let (send_tx, send_rx) = mpsc::sync_channel(512);
+                            let (wake_tx, wake_rx) = tokio_mpsc::channel(512);
+                            state.recv_tx = Some(recv_tx.clone());
+                            state.send_rx = Some(send_rx);
+                            state.wake_tx = Some(wake_tx);
+                            let read_half = slipstream_client::SlipstreamRecvHalf {
+                                recv_rx,
+                                pending: Vec::new(),
+                                pending_off: 0,
+                            };
+                            let write_half =
+                                slipstream_client::SlipstreamSendHalf::new(send_tx, wake_rx);
+                            let _ = ctx.accept_tx.send((read_half, write_half));
+                            if !bytes.is_null() && length > 0 {
+                                let slice = std::slice::from_raw_parts(bytes, length);
+                                let _ = state.recv_tx.as_ref().unwrap().try_send(slice.to_vec());
+                            }
+                        } else if state.stream_id == Some(stream_id) {
+                            if !bytes.is_null() && length > 0 {
+                                let slice = std::slice::from_raw_parts(bytes, length);
+                                if let Some(ref tx) = state.recv_tx {
+                                    let _ = tx.try_send(slice.to_vec());
+                                }
                             }
                         }
                     }
                 }
-            }
-            picoquic_callback_stream_fin => {
-                let mut map = ctx.connections.lock().unwrap();
-                if let Some(state) = map.get_mut(&key) {
-                    if state.stream_id == Some(stream_id) {
-                        if let Some(ref tx) = state.recv_tx {
-                            let _ = tx.try_send(Vec::new());
+                picoquic_callback_stream_fin => {
+                    let mut map = ctx.connections.lock().unwrap();
+                    if let Some(state) = map.get_mut(&key) {
+                        if state.stream_id == Some(stream_id) {
+                            if let Some(ref tx) = state.recv_tx {
+                                let _ = tx.try_send(Vec::new());
+                            }
                         }
                     }
                 }
+                picoquic_callback_close
+                | picoquic_callback_application_close
+                | picoquic_callback_stateless_reset => {
+                    let mut map = ctx.connections.lock().unwrap();
+                    map.remove(&key);
+                }
+                _ => {}
             }
-            picoquic_callback_close
-            | picoquic_callback_application_close
-            | picoquic_callback_stateless_reset => {
-                let mut map = ctx.connections.lock().unwrap();
-                map.remove(&key);
-            }
-            _ => {}
+            0
         }
-        0
     }
 
     /// SAFETY: callback_ctx is a valid pointer to ServerGlobalCtx; only used until packet_loop returns.
@@ -1138,44 +1157,48 @@ mod slipstream_server {
         callback_ctx: *mut std::ffi::c_void,
         arg: *mut std::ffi::c_void,
     ) -> c_int {
-        let ctx = &*(callback_ctx as *const ServerGlobalCtx);
-        if cb_mode == PICOQUIC_PACKET_LOOP_READY && !arg.is_null() {
-            let opt = &mut *(arg as *mut picoquic_packet_loop_options_t);
-            opt._flags = 1; /* do_time_check: wake periodically to drain send_rx */
-        }
-        if cb_mode == PICOQUIC_PACKET_LOOP_TIME_CHECK && !arg.is_null() {
-            let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
-            /* Always cap idle wait at 1ms so new writes from async tasks are noticed quickly. */
-            if time_arg.delta_t > 1_000 {
-                time_arg.delta_t = 1_000;
+        unsafe {
+            let ctx = &*(callback_ctx as *const ServerGlobalCtx);
+            if cb_mode == PICOQUIC_PACKET_LOOP_READY && !arg.is_null() {
+                let opt = &mut *(arg as *mut picoquic_packet_loop_options_t);
+                opt._flags = 1; /* do_time_check: wake periodically to drain send_rx */
             }
-        }
-        if cb_mode == PICOQUIC_PACKET_LOOP_AFTER_RECEIVE
-            || cb_mode == PICOQUIC_PACKET_LOOP_AFTER_SEND
-        {
-            let mut map = ctx.connections.lock().unwrap();
-            for (_key, state) in map.iter_mut() {
-                if let Some(sid) = state.stream_id {
-                    if let Some(ref send_rx) = state.send_rx {
-                        let cnx = state.cnx;
-                        let wake_tx = state.wake_tx.as_ref();
-                        while let Ok(data) = send_rx.try_recv() {
-                            let fin = if data.is_empty() { 1 } else { 0 };
-                            let len = data.len();
-                            if len == 0 && fin != 0 {
-                                let _ = picoquic_add_to_stream(cnx, sid, std::ptr::null(), 0, 1);
-                            } else if !data.is_empty() {
-                                let _ = picoquic_add_to_stream(cnx, sid, data.as_ptr(), len, fin);
-                            }
-                            if let Some(tx) = wake_tx {
-                                let _ = tx.try_send(());
+            if cb_mode == PICOQUIC_PACKET_LOOP_TIME_CHECK && !arg.is_null() {
+                let time_arg = &mut *(arg as *mut packet_loop_time_check_arg_t);
+                /* Always cap idle wait at 1ms so new writes from async tasks are noticed quickly. */
+                if time_arg.delta_t > 1_000 {
+                    time_arg.delta_t = 1_000;
+                }
+            }
+            if cb_mode == PICOQUIC_PACKET_LOOP_AFTER_RECEIVE
+                || cb_mode == PICOQUIC_PACKET_LOOP_AFTER_SEND
+            {
+                let mut map = ctx.connections.lock().unwrap();
+                for (_key, state) in map.iter_mut() {
+                    if let Some(sid) = state.stream_id {
+                        if let Some(ref send_rx) = state.send_rx {
+                            let cnx = state.cnx;
+                            let wake_tx = state.wake_tx.as_ref();
+                            while let Ok(data) = send_rx.try_recv() {
+                                let fin = if data.is_empty() { 1 } else { 0 };
+                                let len = data.len();
+                                if len == 0 && fin != 0 {
+                                    let _ =
+                                        picoquic_add_to_stream(cnx, sid, std::ptr::null(), 0, 1);
+                                } else if !data.is_empty() {
+                                    let _ =
+                                        picoquic_add_to_stream(cnx, sid, data.as_ptr(), len, fin);
+                                }
+                                if let Some(tx) = wake_tx {
+                                    let _ = tx.try_send(());
+                                }
                             }
                         }
                     }
                 }
             }
+            0
         }
-        0
     }
 
     /// Directory for temporary PEM files used by picoquic. Cached so all threads use the same path (avoids different current_dir() in spawned thread breaking path_for_openssl).
