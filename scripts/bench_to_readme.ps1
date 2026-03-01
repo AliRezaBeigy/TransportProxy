@@ -1,7 +1,7 @@
 # Run benchmarks and update README with results.
 # Usage:
 #   .\scripts\bench_to_readme.ps1                     # run all libs, merge, update README
-#   .\scripts\bench_to_readme.ps1 -Lib default         # run only default (kcp_tokio, quinn, kcp_deepseek, kcprs)
+#   .\scripts\bench_to_readme.ps1 -Lib default         # run only default (kcp_tokio, quinn, kcp_deepseek, kcprs) — no optional features
 #   .\scripts\bench_to_readme.ps1 -Lib ys_kcp          # run only ys_kcp, merge into existing, update README
 #   .\scripts\bench_to_readme.ps1 -Lib kcp_sys         # run only kcp_sys, merge into existing, update README
 #   .\scripts\bench_to_readme.ps1 -Lib slipstream_picoquic  # run only slipstream-picoquic (requires C lib built)
@@ -16,7 +16,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$ProjectRoot = Split-Path -Parent $PSScriptRoot
 if (-not (Test-Path (Join-Path $ProjectRoot "Cargo.toml"))) {
     $ProjectRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 }
@@ -96,7 +96,7 @@ if (-not $SkipRun) {
             Remove-Item -Recurse -Force $CriterionDir
             Rename-Item -Path $CriterionMerged -NewName "criterion"
         } elseif ($Lib -eq 'default') {
-            Write-Host "Running benchmarks (default: kcp_tokio, kcp_deepseek, kcprs)..."
+            Write-Host "Running benchmarks (default: kcp_tokio, quinn, kcp_deepseek, kcprs)..."
             & cargo bench 2>&1 | Out-Host
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         } elseif ($Lib -eq 'ys_kcp') {
@@ -351,16 +351,22 @@ function Get-LatencySuccessRatePercent($latencyGroupId) {
 # Build markdown tables by group (order: tokio, deepseek, kcprs, ys_kcp, kcp_sys; each throughput/latency/concurrent)
 $groupOrder = @(
     "kcp_tokio_throughput",
+    "quinn_throughput",
+    "slipstream_throughput",
     "kcp_deepseek_throughput",
     "kcprs_throughput",
     "ys_kcp_throughput",
     "kcp_sys_throughput",
     "kcp_tokio_latency",
+    "quinn_latency",
+    "slipstream_latency",
     "kcp_deepseek_latency",
     "kcprs_latency",
     "ys_kcp_latency",
     "kcp_sys_latency",
     "kcp_tokio_concurrent",
+    "quinn_concurrent",
+    "slipstream_concurrent",
     "kcp_deepseek_concurrent",
     "kcprs_concurrent",
     "ys_kcp_concurrent"

@@ -1,161 +1,31 @@
-//! Transport abstraction: KCP (kcp-tokio), QUIC (quinn), and optional slipstream-picoquic.
+//! Slipstream-picoquic QUIC transport (optional feature): stream wrapper, client bridge, server.
 
 use anyhow::Result;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-/// User-selectable transport for proxy server and client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Transport {
-    /// KCP over UDP (kcp-tokio). Default.
-    #[default]
-    KcpTokio,
-    /// QUIC over UDP with TLS (quinn).
-    Quinn,
-    /// QUIC over UDP via slipstream-picoquic C library (optional feature).
-    #[cfg(feature = "slipstream-picoquic")]
-    SlipstreamPicoQuic,
-}
+use super::ProxyStream;
 
-impl std::str::FromStr for Transport {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "kcp-tokio" | "kcptokio" | "kcp" => Ok(Transport::KcpTokio),
-            "quinn" | "quic" => Ok(Transport::Quinn),
-            #[cfg(feature = "slipstream-picoquic")]
-            "slipstream-picoquic" | "slipstream" | "picoquic" => Ok(Transport::SlipstreamPicoQuic),
-            _ => {
-                #[cfg(feature = "slipstream-picoquic")]
-                return Err(format!(
-                    "unknown transport '{}'; use kcp-tokio, quinn, or slipstream-picoquic",
-                    s
-                ));
-                #[cfg(not(feature = "slipstream-picoquic"))]
-                {
-                    if s.to_lowercase().contains("slipstream")
-                        || s.to_lowercase().contains("picoquic")
-                    {
-                        return Err(format!(
-                            "transport '{}' requires building with --features slipstream-picoquic; see README",
-                            s
-                        ));
-                    }
-                    Err(format!("unknown transport '{}'; use kcp-tokio or quinn", s))
-                }
-            }
-        }
-    }
-}
-
-impl Transport {
-    /// List of transport names for help text.
-    pub const fn available() -> &'static [&'static str] {
-        #[cfg(feature = "slipstream-picoquic")]
-        return &["kcp-tokio", "quinn", "slipstream-picoquic"];
-        #[cfg(not(feature = "slipstream-picoquic"))]
-        return &["kcp-tokio", "quinn"];
-    }
-}
-
-/// A stream that can be used with relay_bidirectional.
-/// Wraps either a KCP stream, a QUIC (quinn) stream, or slipstream-picoquic stream.
-pub enum ProxyStream {
-    KcpTokio(kcp_tokio::KcpStream),
-    Quinn(QuinnBiStream),
-    #[cfg(feature = "slipstream-picoquic")]
-    SlipstreamPicoQuic(SlipstreamPicoQuicStream),
-}
-
-impl AsyncRead for ProxyStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            ProxyStream::KcpTokio(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            ProxyStream::Quinn(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            #[cfg(feature = "slipstream-picoquic")]
-            ProxyStream::SlipstreamPicoQuic(s) => std::pin::Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for ProxyStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match self.get_mut() {
-            ProxyStream::KcpTokio(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            ProxyStream::Quinn(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            #[cfg(feature = "slipstream-picoquic")]
-            ProxyStream::SlipstreamPicoQuic(s) => std::pin::Pin::new(s).poll_write(cx, buf),
-        }
-    }
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            ProxyStream::KcpTokio(s) => std::pin::Pin::new(s).poll_flush(cx),
-            ProxyStream::Quinn(s) => std::pin::Pin::new(s).poll_flush(cx),
-            #[cfg(feature = "slipstream-picoquic")]
-            ProxyStream::SlipstreamPicoQuic(s) => std::pin::Pin::new(s).poll_flush(cx),
-        }
-    }
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            ProxyStream::KcpTokio(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            ProxyStream::Quinn(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            #[cfg(feature = "slipstream-picoquic")]
-            ProxyStream::SlipstreamPicoQuic(s) => std::pin::Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
-
-impl ProxyStream {
-    pub fn peer_addr(&self) -> Option<SocketAddr> {
-        match self {
-            ProxyStream::KcpTokio(s) => Some(*s.peer_addr()),
-            ProxyStream::Quinn(_) => None,
-            #[cfg(feature = "slipstream-picoquic")]
-            ProxyStream::SlipstreamPicoQuic(s) => s.peer_addr(),
-        }
-    }
-}
-
-#[cfg(feature = "slipstream-picoquic")]
 /// Stream wrapper for slipstream-picoquic (placeholder or C API bridge).
 pub struct SlipstreamPicoQuicStream {
     inner: SlipstreamStreamInner,
 }
 
-#[cfg(feature = "slipstream-picoquic")]
 enum SlipstreamStreamInner {
     Placeholder(tokio::io::DuplexStream),
     Bridged {
-        recv: slipstream_client::SlipstreamRecvHalf,
-        send: slipstream_client::SlipstreamSendHalf,
+        recv: client::SlipstreamRecvHalf,
+        send: client::SlipstreamSendHalf,
     },
 }
 
-#[cfg(feature = "slipstream-picoquic")]
 impl SlipstreamPicoQuicStream {
     pub fn new(inner: tokio::io::DuplexStream) -> Self {
         Self {
             inner: SlipstreamStreamInner::Placeholder(inner),
         }
     }
-    pub fn new_bridged(
-        recv: slipstream_client::SlipstreamRecvHalf,
-        send: slipstream_client::SlipstreamSendHalf,
-    ) -> Self {
+    pub fn new_bridged(recv: client::SlipstreamRecvHalf, send: client::SlipstreamSendHalf) -> Self {
         Self {
             inner: SlipstreamStreamInner::Bridged { recv, send },
         }
@@ -165,7 +35,6 @@ impl SlipstreamPicoQuicStream {
     }
 }
 
-#[cfg(feature = "slipstream-picoquic")]
 impl AsyncRead for SlipstreamPicoQuicStream {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -183,7 +52,6 @@ impl AsyncRead for SlipstreamPicoQuicStream {
     }
 }
 
-#[cfg(feature = "slipstream-picoquic")]
 impl AsyncWrite for SlipstreamPicoQuicStream {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
@@ -223,198 +91,79 @@ impl AsyncWrite for SlipstreamPicoQuicStream {
     }
 }
 
-/// Wraps quinn's SendStream + RecvStream as a single AsyncRead + AsyncWrite.
-pub struct QuinnBiStream {
-    recv: quinn::RecvStream,
-    send: quinn::SendStream,
-}
+// --- Public API ---
 
-impl QuinnBiStream {
-    pub fn new(recv: quinn::RecvStream, send: quinn::SendStream) -> Self {
-        Self { recv, send }
-    }
-}
-
-impl AsyncRead for QuinnBiStream {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.get_mut().recv).poll_read(cx, buf)
-    }
-}
-
-fn quinn_err_to_io(e: impl std::fmt::Display + Send + Sync + 'static) -> std::io::Error {
-    std::io::Error::other(e.to_string())
-}
-
-impl AsyncWrite for QuinnBiStream {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        match std::pin::Pin::new(&mut self.get_mut().send).poll_write(cx, buf) {
-            std::task::Poll::Ready(Ok(n)) => std::task::Poll::Ready(Ok(n)),
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(quinn_err_to_io(e))),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match std::pin::Pin::new(&mut self.get_mut().send).poll_flush(cx) {
-            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(quinn_err_to_io(e))),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-    fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        match std::pin::Pin::new(&mut self.get_mut().send).poll_shutdown(cx) {
-            std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(())),
-            std::task::Poll::Ready(Err(e)) => std::task::Poll::Ready(Err(quinn_err_to_io(e))),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
-}
-
-// --- Quinn server config (self-signed cert) ---
-
-const QUINN_ALPN: &[u8] = b"proxy-server";
-
-/// Build quinn ServerConfig with a generated self-signed certificate.
-/// Returns (ServerConfig, cert_der for clients that need to verify, _key_der).
-pub fn quinn_server_config() -> Result<(
-    quinn::ServerConfig,
-    rustls::pki_types::CertificateDer<'static>,
-    rustls::pki_types::PrivateKeyDer<'static>,
-)> {
-    let key_pair = rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256)
-        .map_err(|e| anyhow::anyhow!("rcgen key: {}", e))?;
-    let key_der_bytes = key_pair.serialize_der();
-    let mut params = rcgen::CertificateParams::default();
-    params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "localhost");
-    params.key_pair = Some(key_pair);
-    let cert = rcgen::Certificate::from_params(params)
-        .map_err(|e| anyhow::anyhow!("rcgen cert: {}", e))?;
-    let cert_der = rustls::pki_types::CertificateDer::from(
-        cert.serialize_der()
-            .map_err(|e| anyhow::anyhow!("cert serialize: {}", e))?,
-    );
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_der_bytes)
-        .map_err(|e| anyhow::anyhow!("key der: {}", e))?;
-    let mut server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der.clone()], key_der.clone_key())?;
-    server_crypto.alpn_protocols = vec![QUINN_ALPN.to_vec()];
-    let quic_server = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?;
-    let mut server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(quic_server));
-    let transport = std::sync::Arc::get_mut(&mut server_config.transport).unwrap();
-    transport.max_concurrent_uni_streams(0_u8.into());
-    Ok((server_config, cert_der, key_der))
-}
-
-/// Build quinn ClientConfig that trusts the given server cert (e.g. from quinn_server_config).
-pub fn quinn_client_config_with_cert(
-    cert_der: &rustls::pki_types::CertificateDer<'static>,
-) -> Result<quinn::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(cert_der.clone())?;
-    let mut client_crypto = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    client_crypto.alpn_protocols = vec![QUINN_ALPN.to_vec()];
-    Ok(quinn::ClientConfig::new(std::sync::Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
-    )))
-}
-
-/// Build quinn ClientConfig that accepts any server certificate (insecure; for local/dev use).
-pub fn quinn_client_config_insecure() -> Result<quinn::ClientConfig> {
-    #[derive(Debug)]
-    struct AcceptAnyVerifier;
-    impl rustls::client::danger::ServerCertVerifier for AcceptAnyVerifier {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls::pki_types::CertificateDer,
-            _intermediates: &[rustls::pki_types::CertificateDer],
-            _server_name: &rustls::pki_types::ServerName,
-            _ocsp_response: &[u8],
-            _now: rustls::pki_types::UnixTime,
-        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        }
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-        }
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            vec![
-                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-                rustls::SignatureScheme::ED25519,
-            ]
-        }
-    }
-    let mut client_crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyVerifier))
-        .with_no_client_auth();
-    client_crypto.alpn_protocols = vec![QUINN_ALPN.to_vec()];
-    Ok(quinn::ClientConfig::new(std::sync::Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
-    )))
-}
-
-/// Connect to a quinn server and open one bidirectional stream.
-/// Uses insecure client config (accepts any cert).
-pub async fn quinn_connect_stream(
-    server_addr: SocketAddr,
-    server_name: &str,
-    client_config: quinn::ClientConfig,
-) -> Result<ProxyStream> {
-    let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>().unwrap())?;
-    endpoint.set_default_client_config(client_config);
-    let connecting = endpoint.connect(server_addr, server_name)?;
-    let conn = connecting.await?;
-    let (send, recv) = conn.open_bi().await?;
-    Ok(ProxyStream::Quinn(QuinnBiStream::new(recv, send)))
-}
-
-// --- Slipstream-picoquic (optional) ---
-
-#[cfg(feature = "slipstream-picoquic")]
 #[allow(dead_code)]
 const SLIPSTREAM_ALPN: &[u8] = b"proxy-server";
 
-#[cfg(feature = "slipstream-picoquic")]
-mod slipstream_client {
-    use super::*;
+/// Connect to a slipstream-picoquic server and open one bidirectional stream.
+/// If the server uses a self-signed certificate, pass its PEM path as `trusted_cert_path`
+/// so the client can verify it (e.g. for benchmarks or local dev).
+pub async fn connect_stream(
+    server_addr: SocketAddr,
+    server_name: &str,
+    trusted_cert_path: Option<&std::path::Path>,
+) -> Result<ProxyStream> {
+    client::connect_stream(
+        server_addr,
+        server_name,
+        trusted_cert_path.map(std::path::Path::to_path_buf),
+    )
+    .await
+}
+
+/// Run slipstream-picoquic server.
+/// If `cert_key_paths` is `Some((cert_path, key_path))`, use those PEM files (caller keeps them alive).
+/// If `None`, temporary PEM files are created and used for the lifetime of the server.
+pub async fn run_server(
+    listen: SocketAddr,
+    accept_timeout: std::time::Duration,
+    drain_duration: std::time::Duration,
+    upstream: &std::sync::Arc<Option<SocketAddr>>,
+    semaphore: &Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
+    cert_key_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+) -> Result<()> {
+    server::run_server(
+        listen,
+        accept_timeout,
+        drain_duration,
+        upstream,
+        semaphore,
+        shutdown_rx,
+        cert_key_paths,
+    )
+    .await
+}
+
+/// Create temporary PEM files (cert + key) for slipstream-picoquic server and client trust.
+/// Files are deleted when the returned handles are dropped. Use the cert path as
+/// `trusted_cert_path` when connecting the client to the server using the same cert.
+pub fn create_pem_files() -> Result<(tempfile::NamedTempFile, tempfile::NamedTempFile)> {
+    server::create_temp_pem_files()
+}
+
+/// Run first picoquic TLS init and a dummy create/free on the calling thread.
+/// Call before starting the server so the first picoquic_create runs here (helps on Windows).
+pub fn ensure_tls_init() {
+    server::ensure_tls_init();
+}
+
+// --- Client bridge ---
+
+mod client {
+    use super::ProxyStream;
+    use super::SlipstreamPicoQuicStream;
+    use anyhow::Result;
     use libc::size_t;
     use slipstream_picoquic_sys::picoquic::*;
     use std::ffi::CString;
+    use std::net::SocketAddr;
     use std::os::raw::c_int;
     use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
     use std::sync::mpsc;
+    use std::task::Poll;
+    use tokio::io::{AsyncRead, AsyncWrite};
     use tokio::sync::mpsc as tokio_mpsc;
 
     const ALPN: &[u8] = b"proxy-server";
@@ -794,12 +543,9 @@ mod slipstream_client {
             wake_rx,
             pending_send: None,
         };
-        let stream = super::SlipstreamPicoQuicStream::new_bridged(read_half, write_half);
+        let stream = SlipstreamPicoQuicStream::new_bridged(read_half, write_half);
         Ok(ProxyStream::SlipstreamPicoQuic(stream))
     }
-
-    use std::task::Poll;
-    use tokio::io::{AsyncRead, AsyncWrite};
 
     pub(crate) struct SlipstreamRecvHalf {
         pub recv_rx: tokio_mpsc::Receiver<Vec<u8>>,
@@ -914,17 +660,18 @@ mod slipstream_client {
     }
 }
 
-#[cfg(feature = "slipstream-picoquic")]
-use slipstream_client::connect_stream as slipstream_connect_impl;
+// --- Server ---
 
-#[cfg(feature = "slipstream-picoquic")]
-mod slipstream_server {
-    use super::*;
+mod server {
+    use super::client::{SlipstreamRecvHalf, SlipstreamSendHalf};
+    use super::{ProxyStream, SlipstreamPicoQuicStream};
+    use anyhow::Result;
     use libc::size_t;
     use slipstream_picoquic_sys::picoquic::*;
     use std::collections::HashMap;
     use std::ffi::CString;
     use std::io::Write;
+    use std::net::SocketAddr;
     use std::os::raw::c_int;
     use std::sync::mpsc;
     use std::sync::Mutex;
@@ -1059,10 +806,7 @@ mod slipstream_server {
     }
 
     struct ServerGlobalCtx {
-        accept_tx: tokio_mpsc::UnboundedSender<(
-            slipstream_client::SlipstreamRecvHalf,
-            slipstream_client::SlipstreamSendHalf,
-        )>,
+        accept_tx: tokio_mpsc::UnboundedSender<(SlipstreamRecvHalf, SlipstreamSendHalf)>,
         connections: Mutex<HashMap<usize, ServerConnState>>,
     }
 
@@ -1106,13 +850,12 @@ mod slipstream_server {
                             state.recv_tx = Some(recv_tx.clone());
                             state.send_rx = Some(send_rx);
                             state.wake_tx = Some(wake_tx);
-                            let read_half = slipstream_client::SlipstreamRecvHalf {
+                            let read_half = SlipstreamRecvHalf {
                                 recv_rx,
                                 pending: Vec::new(),
                                 pending_off: 0,
                             };
-                            let write_half =
-                                slipstream_client::SlipstreamSendHalf::new(send_tx, wake_rx);
+                            let write_half = SlipstreamSendHalf::new(send_tx, wake_rx);
                             let _ = ctx.accept_tx.send((read_half, write_half));
                             if !bytes.is_null() && length > 0 {
                                 let slice = std::slice::from_raw_parts(bytes, length);
@@ -1276,10 +1019,8 @@ mod slipstream_server {
         let alpn_c = CString::new(ALPN).map_err(|_| anyhow::anyhow!("ALPN"))?;
 
         // Unbounded so the picoquic callback never drops a connection when the tokio loop is slow.
-        let (accept_tx, mut accept_rx) = tokio_mpsc::unbounded_channel::<(
-            slipstream_client::SlipstreamRecvHalf,
-            slipstream_client::SlipstreamSendHalf,
-        )>();
+        let (accept_tx, mut accept_rx) =
+            tokio_mpsc::unbounded_channel::<(SlipstreamRecvHalf, SlipstreamSendHalf)>();
         let port = listen.port() as i32;
         let alpn_c = alpn_c;
         std::thread::spawn(move || {
@@ -1436,8 +1177,8 @@ mod slipstream_server {
                             let upstream = std::sync::Arc::clone(upstream);
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                let stream = super::SlipstreamPicoQuicStream::new_bridged(read_half, write_half);
-                                let stream = super::ProxyStream::SlipstreamPicoQuic(stream);
+                                let stream = SlipstreamPicoQuicStream::new_bridged(read_half, write_half);
+                                let stream = ProxyStream::SlipstreamPicoQuic(stream);
                                 if let Err(e) = crate::handle_connection(stream, *upstream).await {
                                     tracing::error!("Connection failed: {}", e);
                                 }
@@ -1452,60 +1193,4 @@ mod slipstream_server {
         tokio::time::sleep(drain_duration).await;
         Ok(())
     }
-}
-
-/// Connect to a slipstream-picoquic server and open one bidirectional stream.
-/// If the server uses a self-signed certificate, pass its PEM path as `trusted_cert_path`
-/// so the client can verify it (e.g. for benchmarks or local dev).
-#[cfg(feature = "slipstream-picoquic")]
-pub async fn slipstream_connect_stream(
-    server_addr: SocketAddr,
-    server_name: &str,
-    trusted_cert_path: Option<&std::path::Path>,
-) -> Result<ProxyStream> {
-    slipstream_connect_impl(
-        server_addr,
-        server_name,
-        trusted_cert_path.map(std::path::Path::to_path_buf),
-    )
-    .await
-}
-
-/// Run slipstream-picoquic server.
-/// If `cert_key_paths` is `Some((cert_path, key_path))`, use those PEM files (caller keeps them alive).
-/// If `None`, temporary PEM files are created and used for the lifetime of the server.
-#[cfg(feature = "slipstream-picoquic")]
-pub async fn run_slipstream_picoquic_server(
-    listen: SocketAddr,
-    accept_timeout: std::time::Duration,
-    drain_duration: std::time::Duration,
-    upstream: &std::sync::Arc<Option<SocketAddr>>,
-    semaphore: &Option<std::sync::Arc<tokio::sync::Semaphore>>,
-    shutdown_rx: &mut tokio::sync::broadcast::Receiver<()>,
-    cert_key_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-) -> Result<()> {
-    slipstream_server::run_server(
-        listen,
-        accept_timeout,
-        drain_duration,
-        upstream,
-        semaphore,
-        shutdown_rx,
-        cert_key_paths,
-    )
-    .await
-}
-
-/// Create temporary PEM files (cert + key) for slipstream-picoquic server and client trust.
-/// Files are deleted when the returned handles are dropped. Use the cert path as
-/// `trusted_cert_path` when connecting the client to the server using the same cert.
-#[cfg(feature = "slipstream-picoquic")]
-pub fn create_slipstream_pem_files() -> Result<(tempfile::NamedTempFile, tempfile::NamedTempFile)> {
-    slipstream_server::create_temp_pem_files()
-}
-
-/// Run first picoquic TLS init and a dummy create/free on the calling thread. Call before starting the server so the first picoquic_create runs here (helps on Windows).
-#[cfg(feature = "slipstream-picoquic")]
-pub fn ensure_slipstream_picoquic_tls_init() {
-    slipstream_server::ensure_tls_init();
 }

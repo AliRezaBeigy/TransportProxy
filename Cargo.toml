@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Transport comparison (KCP & QUIC): proxy harness and benchmarks"
 license = "MIT"
+autobenches = false
 
 [features]
 default = []
