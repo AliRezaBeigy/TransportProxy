@@ -431,10 +431,15 @@ if ($comparisonRows.Count -gt 0) {
             $ns = $row._timeValues[$gr.Label]
             $minNs = ($row._timeValues.Values | Where-Object { $null -ne $_ } | Measure-Object -Minimum).Minimum
             $isBest = ($null -ne $ns -and $null -ne $minNs -and $ns -le $minNs * 1.0001)
+            # Append footnote markers
+            if ($gr.Label -eq "kcprs" -and $val -eq '-') { $val = "-¹" }
             $cells += if ($isBest -and $val -ne '-') { "**$val**" } else { $val }
         }
         [void]$sb.AppendLine('| ' + ($cells -join ' | ') + ' |')
     }
+    [void]$sb.AppendLine("")
+    # Footnote for time-per-roundtrip table
+    [void]$sb.AppendLine("> ¹ ``kcprs`` 4 KiB/8 KiB skipped (see throughput notes). ``kcp_deepseek``/``kcprs``/``ys_kcp`` times include ~1 ms synchronous polling floor; see throughput methodology notes.")
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("### Comparison: throughput (higher is better)")
     [void]$sb.AppendLine("")
@@ -447,10 +452,20 @@ if ($comparisonRows.Count -gt 0) {
             $thrStr = $row["$($gr.Label)_thr"]
             $bps = $row._throughputBps[$gr.Label]
             $isBest = ($null -ne $bps -and $null -ne $maxBps -and $bps -ge $maxBps * 0.9999 -and $thrStr -ne '-')
+            # Append footnote markers to kcprs and kcp_sys cells in relevant rows
+            if ($gr.Label -eq "kcprs" -and $thrStr -eq '-') { $thrStr = "-¹" }
+            elseif ($gr.Label -eq "kcp_sys" -and $thrStr -ne '-') { $thrStr = if ($isBest) { "**${thrStr}**²" } else { "${thrStr}²" }; $isBest = $false }
             $cells += if ($isBest) { "**$thrStr**" } else { $thrStr }
         }
         [void]$sb.AppendLine('| ' + ($cells -join ' | ') + ' |')
     }
+    [void]$sb.AppendLine("")
+    # Methodology notes for throughput table
+    [void]$sb.AppendLine("> **Methodology notes:**")
+    [void]$sb.AppendLine("> - ``kcp_tokio`` and ``quinn`` reuse a single connection (and stream, for quinn) across all hot-path iterations per payload size — only the per-roundtrip cost is measured. ``quinn`` uses length-prefix framing to keep the QUIC stream open without calling ``finish()``, matching ``kcp_tokio``'s stream-reuse pattern.")
+    [void]$sb.AppendLine("> - ``kcp_deepseek``, ``kcprs``, and ``ys_kcp`` use a synchronous polling harness: both client and server run in the same thread and exchange UDP datagrams via a busy-wait loop (200 µs sleep per iteration). The ~1 ms floor in their results reflects this polling overhead, not raw protocol throughput. ``kcp_tokio`` and ``quinn`` use a real async I/O server with OS-scheduled I/O.")
+    [void]$sb.AppendLine("> - ¹ ``kcprs`` 4 KiB/8 KiB skipped: ``kcprs-0.5.0`` panics on multi-segment payloads due to an out-of-bounds bug in ``parse_ack()`` (``snd_buf.remove(i)`` inside a non-breaking loop over ``snd_buf.len()``).")
+    [void]$sb.AppendLine("> - ² ``kcp_sys`` throughput reinitializes client and server per iteration (the kcp-sys server exits after the first stream closes, causing subsequent ``accept()`` calls to hang). These numbers measure connect+roundtrip cost, not sustained throughput — treat them as equivalent to the latency bench.")
     [void]$sb.AppendLine("")
     # Success rate table (when log was produced)
     $anySuccess = $false

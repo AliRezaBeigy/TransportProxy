@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use criterion::{black_box, Criterion, Throughput};
+use quinn::{RecvStream, SendStream};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,12 +110,48 @@ pub fn start_quinn_echo_server_in_background_with_config(
                                 Err(quinn::ConnectionError::ApplicationClosed(_)) => break,
                                 Err(_) => break,
                             };
-                            let data = match recv.read_to_end(QUINN_READ_LIMIT).await {
-                                Ok(d) => d,
-                                Err(_) => break,
-                            };
-                            let _ = send.write_all(&data).await;
-                            let _ = send.finish();
+                            // Each stream uses length-prefix framing so the client can reuse
+                            // a single stream across multiple throughput iterations without
+                            // closing it. The latency/concurrent benches still open a fresh
+                            // stream per roundtrip and rely on read_to_end — they send a
+                            // sentinel length of 0xFFFFFFFF to signal "EOF mode", falling
+                            // back to the old read_to_end path.
+                            tokio::spawn(async move {
+                                loop {
+                                    // Read 4-byte LE length prefix.
+                                    let mut len_buf = [0u8; 4];
+                                    if recv.read_exact(&mut len_buf).await.is_err() {
+                                        break;
+                                    }
+                                    let len = u32::from_le_bytes(len_buf) as usize;
+                                    // Sentinel: latency/concurrent benches signal single-shot
+                                    // mode by sending length == QUINN_READ_LIMIT as u32.
+                                    if len == QUINN_READ_LIMIT {
+                                        // Fall back: read remaining data until stream close.
+                                        let data = match recv.read_to_end(QUINN_READ_LIMIT).await {
+                                            Ok(d) => d,
+                                            Err(_) => break,
+                                        };
+                                        let _ = send.write_all(&data).await;
+                                        let _ = send.finish();
+                                        break;
+                                    }
+                                    if len == 0 || len > QUINN_READ_LIMIT {
+                                        break;
+                                    }
+                                    let mut data = vec![0u8; len];
+                                    if recv.read_exact(&mut data).await.is_err() {
+                                        break;
+                                    }
+                                    // Echo back: length prefix + data.
+                                    if send.write_all(&len_buf).await.is_err() {
+                                        break;
+                                    }
+                                    if send.write_all(&data).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            });
                         }
                     });
                 }
@@ -127,6 +164,9 @@ pub fn start_quinn_echo_server_in_background_with_config(
 }
 
 /// Reuses a pre-created Endpoint so socket creation is not in the hot path.
+/// Used by latency bench: opens a fresh connection+stream per call (measures connect+RTT).
+/// Sends the sentinel length prefix (QUINN_READ_LIMIT as u32 LE) so the server falls into
+/// read_to_end mode, then writes the payload and reads back the echo.
 async fn quinn_echo_roundtrip(
     current_addr: &Arc<RwLock<SocketAddr>>,
     payload: &[u8],
@@ -136,6 +176,9 @@ async fn quinn_echo_roundtrip(
     let connecting = endpoint.connect(addr, "localhost")?;
     let conn = tokio::time::timeout(IO_TIMEOUT, connecting).await??;
     let (mut send, mut recv) = conn.open_bi().await?;
+    // Send sentinel so server uses read_to_end echo mode.
+    let sentinel = (QUINN_READ_LIMIT as u32).to_le_bytes();
+    tokio::time::timeout(IO_TIMEOUT, send.write_all(&sentinel)).await??;
     tokio::time::timeout(IO_TIMEOUT, send.write_all(payload)).await??;
     send.finish()?;
     let mut buf = vec![0u8; payload.len()];
@@ -145,14 +188,39 @@ async fn quinn_echo_roundtrip(
 }
 
 /// One echo roundtrip on an already-established quinn::Connection (no reconnect/TLS).
-/// Opens a new bi-directional stream per roundtrip — standard QUIC multiplexing.
+/// Opens a new bi-directional stream per roundtrip — used by the concurrent bench.
+/// Sends the sentinel so the server uses read_to_end mode for this single-shot stream.
 pub async fn quinn_connection_roundtrip(conn: &quinn::Connection, payload: &[u8]) -> Result<usize> {
     let (mut send, mut recv) = conn.open_bi().await?;
+    let sentinel = (QUINN_READ_LIMIT as u32).to_le_bytes();
+    tokio::time::timeout(IO_TIMEOUT, send.write_all(&sentinel)).await??;
     tokio::time::timeout(IO_TIMEOUT, send.write_all(payload)).await??;
     send.finish()?;
     let mut buf = vec![0u8; payload.len()];
     tokio::time::timeout(IO_TIMEOUT, recv.read_exact(&mut buf)).await??;
     Ok(payload.len())
+}
+
+/// One echo roundtrip on an already-open stream using length-prefix framing.
+/// Used by bench_quinn_throughput to reuse a single stream across all hot-path
+/// iterations, avoiding open_bi() overhead. No finish() is called — the stream
+/// stays open until the bench group ends.
+pub async fn quinn_stream_roundtrip(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    payload: &[u8],
+) -> Result<usize> {
+    let len = payload.len() as u32;
+    let len_buf = len.to_le_bytes();
+    tokio::time::timeout(IO_TIMEOUT, send.write_all(&len_buf)).await??;
+    tokio::time::timeout(IO_TIMEOUT, send.write_all(payload)).await??;
+    // Read back 4-byte length prefix + payload.
+    let mut resp_len_buf = [0u8; 4];
+    tokio::time::timeout(IO_TIMEOUT, recv.read_exact(&mut resp_len_buf)).await??;
+    let resp_len = u32::from_le_bytes(resp_len_buf) as usize;
+    let mut buf = vec![0u8; resp_len];
+    tokio::time::timeout(IO_TIMEOUT, recv.read_exact(&mut buf)).await??;
+    Ok(buf.len())
 }
 
 pub fn bench_quinn_throughput(c: &mut Criterion) {
@@ -178,22 +246,27 @@ pub fn bench_quinn_throughput(c: &mut Criterion) {
     group.warm_up_time(Duration::from_millis(500));
     group.measurement_time(Duration::from_secs(3));
     group.sample_size(30);
+    // Store connection + open stream across iterations: avoids open_bi() in the hot path,
+    // matching kcp_tokio which reuses the same KcpStream. Length-prefix framing keeps the
+    // stream alive without requiring finish()/EOF per roundtrip.
     for size in [64, 256, 1024, 4096, 8192] {
         group.throughput(Throughput::Bytes(size as u64));
         let name = format!("echo_{}b", size);
         eprintln!(
-            "[bench]   running {} (1 echo round-trip, connection reused per payload size)",
+            "[bench]   running {} (1 echo round-trip, connection+stream reused per payload size)",
             name
         );
         let client_endpoint = Arc::clone(&client_endpoint);
         let func_id = name.clone();
         let payload = vec![0xABu8; size];
-        let conn_cell: RefCell<Option<quinn::Connection>> = RefCell::new(None);
+        // State: connection + reusable open bi-stream (send + recv).
+        let stream_cell: RefCell<Option<(quinn::Connection, SendStream, RecvStream)>> =
+            RefCell::new(None);
         group.bench_function(name, |b| {
             b.iter(|| {
                 let n = rt.block_on(async {
-                    let mut conn = conn_cell.borrow_mut().take();
-                    if conn.is_none() {
+                    let mut state = stream_cell.borrow_mut().take();
+                    if state.is_none() {
                         let addr = *current_addr.read().await;
                         let connecting = match client_endpoint.connect(addr, "localhost") {
                             Ok(c) => c,
@@ -202,10 +275,8 @@ pub fn bench_quinn_throughput(c: &mut Criterion) {
                                 return 0;
                             }
                         };
-                        match tokio::time::timeout(IO_TIMEOUT, connecting).await {
-                            Ok(Ok(c)) => {
-                                conn = Some(c);
-                            }
+                        let conn = match tokio::time::timeout(IO_TIMEOUT, connecting).await {
+                            Ok(Ok(c)) => c,
                             Ok(Err(e)) => {
                                 eprintln!("[bench] warning: quinn handshake failed: {e}");
                                 return 0;
@@ -214,16 +285,26 @@ pub fn bench_quinn_throughput(c: &mut Criterion) {
                                 eprintln!("[bench] warning: quinn connect timed out");
                                 return 0;
                             }
-                        }
+                        };
+                        let (send, recv) = match conn.open_bi().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[bench] warning: quinn open_bi failed: {e}");
+                                return 0;
+                            }
+                        };
+                        state = Some((conn, send, recv));
                     }
-                    let result = quinn_connection_roundtrip(conn.as_ref().unwrap(), &payload).await;
+                    let (_conn, send, recv) = state.as_mut().unwrap();
+                    let result = quinn_stream_roundtrip(send, recv, &payload).await;
                     match result {
                         Ok(n) => {
-                            *conn_cell.borrow_mut() = conn;
+                            *stream_cell.borrow_mut() = state;
                             n
                         }
                         Err(e) => {
                             eprintln!("[bench] warning: quinn throughput roundtrip failed: {e}");
+                            // Drop broken state; next iteration will reconnect.
                             0
                         }
                     }
